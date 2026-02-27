@@ -1,0 +1,11 @@
+# CODEOWNERS for streamline-desktop
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for everything in the repo
+* @streamlinelabs/desktop
+
+# CI/CD and GitHub configuration
+/.github/ @streamlinelabs/desktop @streamlinelabs/maintainers
+
+# Rust backend
+/src-tauri/ @streamlinelabs/desktop @streamlinelabs/maintainers
