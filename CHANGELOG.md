@@ -16,9 +16,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - System tray integration with menu controls
 - Web dashboard embedded via WebView
 - Server lifecycle management (start/stop/restart)
+- Consumer group monitoring view
+- Message viewer with JSON formatting
+- Connection settings panel
+- Topic browser component
+- Unit tests for connection manager
+
+### Fixed
+- Correct window title and icon configuration
+- Resolve Tauri IPC handler registration
+
+### Changed
+- Extract Tauri command bindings
+- Optimize data processing loop
+- Clean up module organization
 
 ### Infrastructure
 - Vite build pipeline with React plugin
 - Rust backend via Tauri
-- TypeScript configuration
+- TypeScript strict mode configuration
 - Apache 2.0 license
