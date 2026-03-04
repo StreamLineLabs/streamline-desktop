@@ -226,14 +226,149 @@ async fn reqwest_get(url: &str) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|e| e.to_string())
 }
 
+/// HTTP POST helper.
+async fn reqwest_post(url: &str, body: &str) -> Result<String, String> {
+    let output = tokio::process::Command::new("curl")
+        .args(["-sf", "-X", "POST", "-H", "Content-Type: application/json", "-d", body, url])
+        .output()
+        .await
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("HTTP POST failed ({}): {}", output.status.code().unwrap_or(-1), stderr));
+    }
+    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+}
+
+/// HTTP DELETE helper.
+async fn reqwest_delete(url: &str) -> Result<String, String> {
+    let output = tokio::process::Command::new("curl")
+        .args(["-sf", "-X", "DELETE", url])
+        .output()
+        .await
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "HTTP DELETE failed ({})",
+            output.status.code().unwrap_or(-1),
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProduceRequest {
+    key: Option<String>,
+    value: String,
+}
+
+#[tauri::command]
+async fn produce_message(
+    state: State<'_, ServerState>,
+    topic: String,
+    key: Option<String>,
+    value: String,
+) -> Result<(), String> {
+    let config = state.config.lock().unwrap().clone();
+    let url = format!("http://127.0.0.1:{}/api/topics/{}/messages", config.http_port, topic);
+    let body = serde_json::to_string(&ProduceRequest { key, value })
+        .map_err(|e| e.to_string())?;
+    reqwest_post(&url, &body).await?;
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+struct ConsumedMessage {
+    key: String,
+    value: String,
+    offset: u64,
+}
+
+#[tauri::command]
+async fn consume_messages(
+    state: State<'_, ServerState>,
+    topic: String,
+    limit: Option<u32>,
+) -> Result<Vec<ConsumedMessage>, String> {
+    let config = state.config.lock().unwrap().clone();
+    let limit = limit.unwrap_or(50);
+    let url = format!(
+        "http://127.0.0.1:{}/api/topics/{}/messages?limit={}",
+        config.http_port, topic, limit
+    );
+    let body = reqwest_get(&url).await?;
+    serde_json::from_str::<Vec<ConsumedMessage>>(&body).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn create_topic(
+    state: State<'_, ServerState>,
+    name: String,
+    partitions: Option<u32>,
+) -> Result<(), String> {
+    let config = state.config.lock().unwrap().clone();
+    let url = format!("http://127.0.0.1:{}/api/topics", config.http_port);
+    let body = serde_json::json!({
+        "name": name,
+        "partitions": partitions.unwrap_or(1),
+    })
+    .to_string();
+    reqwest_post(&url, &body).await?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn delete_topic(
+    state: State<'_, ServerState>,
+    name: String,
+) -> Result<(), String> {
+    let config = state.config.lock().unwrap().clone();
+    let url = format!("http://127.0.0.1:{}/api/topics/{}", config.http_port, name);
+    reqwest_delete(&url).await?;
+    Ok(())
+}
+
+fn settings_path() -> PathBuf {
+    let mut p = dirs_next_data_dir().unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&p).ok();
+    p.push("settings.json");
+    p
+}
+
+#[tauri::command]
+fn save_settings(state: State<'_, ServerState>, settings: ServerConfig) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(settings_path(), json).map_err(|e| e.to_string())?;
+    *state.config.lock().unwrap() = settings;
+    Ok(())
+}
+
+#[tauri::command]
+fn load_settings(state: State<'_, ServerState>) -> ServerConfig {
+    if let Ok(data) = std::fs::read_to_string(settings_path()) {
+        if let Ok(config) = serde_json::from_str::<ServerConfig>(&data) {
+            *state.config.lock().unwrap() = config.clone();
+            return config;
+        }
+    }
+    state.config.lock().unwrap().clone()
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
 fn main() {
+    let initial_config = std::fs::read_to_string(settings_path())
+        .ok()
+        .and_then(|data| serde_json::from_str::<ServerConfig>(&data).ok())
+        .unwrap_or_default();
+
     let state = ServerState {
         process: Mutex::new(None),
-        config: Mutex::new(ServerConfig::default()),
+        config: Mutex::new(initial_config),
     };
 
     tauri::Builder::default()
@@ -287,6 +422,12 @@ fn main() {
             stop_server,
             get_topics,
             get_server_info,
+            produce_message,
+            consume_messages,
+            create_topic,
+            delete_topic,
+            save_settings,
+            load_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Streamline Desktop");
