@@ -54,3 +54,4 @@ cargo fmt --all -- --check
 - Frontend is intentionally minimal — the heavy lifting is in the Streamline web dashboard served via iframe
 - The bundled `streamline` binary is declared in `tauri.conf.json` under `bundle.resources`
 - Ports default to 9092 (Kafka) and 9094 (HTTP) to match the core server defaults
+
