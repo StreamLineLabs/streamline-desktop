@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - style: align sidebar icons with design system (2026-03-05)
 
 - refactor: migrate state management to zustand (2026-03-06)
+
+- fix: resolve dark mode rendering issue on macOS (2026-03-06)
 ## [Unreleased]
 
 ## [0.2.0] - 2026-02-28
