@@ -137,6 +137,66 @@ struct ServerStatus {
     http_port: u16,
 }
 
+// Consumer group types
+#[derive(Serialize, Deserialize)]
+struct ConsumerGroupInfo {
+    group_id: String,
+    state: String,
+    members: u32,
+    #[serde(default)]
+    topics: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ConsumerGroupDetail {
+    group_id: String,
+    state: String,
+    protocol: String,
+    members: Vec<GroupMember>,
+    #[serde(default)]
+    offsets: Vec<GroupOffset>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GroupMember {
+    member_id: String,
+    client_id: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    assignments: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GroupOffset {
+    topic: String,
+    partition: i32,
+    current_offset: i64,
+    log_end_offset: i64,
+    lag: i64,
+}
+
+// Schema registry types
+#[derive(Serialize, Deserialize)]
+struct SchemaSubject {
+    subject: String,
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    schema_type: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SchemaDetail {
+    subject: String,
+    version: u32,
+    id: u32,
+    schema_type: String,
+    schema: String,
+    #[serde(default)]
+    compatibility: String,
+}
+
 #[tauri::command]
 fn get_server_status(state: State<'_, ServerState>) -> ServerStatus {
     let proc = state.process.lock().unwrap();
@@ -330,6 +390,88 @@ async fn delete_topic(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Consumer group commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn list_consumer_groups(state: State<'_, ServerState>) -> Result<Vec<ConsumerGroupInfo>, String> {
+    let config = state.config.lock().unwrap().clone();
+    let url = format!("http://127.0.0.1:{}/api/consumer-groups", config.http_port);
+    let body = reqwest_get(&url).await?;
+    serde_json::from_str::<Vec<ConsumerGroupInfo>>(&body).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn describe_consumer_group(
+    state: State<'_, ServerState>,
+    group_id: String,
+) -> Result<ConsumerGroupDetail, String> {
+    let config = state.config.lock().unwrap().clone();
+    let url = format!(
+        "http://127.0.0.1:{}/api/consumer-groups/{}",
+        config.http_port, group_id
+    );
+    let body = reqwest_get(&url).await?;
+    serde_json::from_str::<ConsumerGroupDetail>(&body).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_consumer_group(
+    state: State<'_, ServerState>,
+    group_id: String,
+) -> Result<(), String> {
+    let config = state.config.lock().unwrap().clone();
+    let url = format!(
+        "http://127.0.0.1:{}/api/consumer-groups/{}",
+        config.http_port, group_id
+    );
+    reqwest_delete(&url).await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Schema registry commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn list_schemas(state: State<'_, ServerState>) -> Result<Vec<SchemaSubject>, String> {
+    let config = state.config.lock().unwrap().clone();
+    let url = format!("http://127.0.0.1:{}/api/schemas/subjects", config.http_port);
+    let body = reqwest_get(&url).await?;
+    // The API may return just subject names as strings or full objects
+    if let Ok(subjects) = serde_json::from_str::<Vec<String>>(&body) {
+        Ok(subjects
+            .into_iter()
+            .map(|s| SchemaSubject {
+                subject: s,
+                version: 0,
+                schema_type: String::new(),
+            })
+            .collect())
+    } else {
+        serde_json::from_str::<Vec<SchemaSubject>>(&body).map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_schema(
+    state: State<'_, ServerState>,
+    subject: String,
+) -> Result<SchemaDetail, String> {
+    let config = state.config.lock().unwrap().clone();
+    let url = format!(
+        "http://127.0.0.1:{}/api/schemas/subjects/{}/versions/latest",
+        config.http_port, subject
+    );
+    let body = reqwest_get(&url).await?;
+    serde_json::from_str::<SchemaDetail>(&body).map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
 fn settings_path() -> PathBuf {
     let mut p = dirs_next_data_dir().unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&p).ok();
@@ -426,6 +568,11 @@ fn main() {
             consume_messages,
             create_topic,
             delete_topic,
+            list_consumer_groups,
+            describe_consumer_group,
+            delete_consumer_group,
+            list_schemas,
+            get_schema,
             save_settings,
             load_settings,
         ])

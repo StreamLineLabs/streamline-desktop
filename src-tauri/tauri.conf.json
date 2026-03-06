@@ -4,6 +4,9 @@
   "version": "0.2.0",
   "identifier": "io.streamline.desktop",
   "build": {
+    "beforeBuildCommand": "npx vite build",
+    "beforeDevCommand": "npx vite dev",
+    "devUrl": "http://localhost:5173",
     "frontendDist": "../dist"
   },
   "app": {
@@ -17,7 +20,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://localhost:* ws://localhost:*"
     },
     "trayIcon": {
       "iconPath": "icons/icon.png",

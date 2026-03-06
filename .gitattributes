@@ -1,0 +1,9 @@
+* text=auto
+*.ts text diff=typescript
+*.tsx text diff=typescript
+*.js text
+*.rs text diff=rust
+*.md text diff=markdown
+*.sh text eol=lf
+package-lock.json linguist-generated=true
+dist/ linguist-generated=true

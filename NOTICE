@@ -1,0 +1,16 @@
+Streamline Desktop
+Copyright 2024-2025 Jose David Baena
+
+This product includes software developed at:
+https://github.com/streamlinelabs/streamline-desktop
+
+Licensed under the Apache License, Version 2.0.
+
+================================================================================
+
+This product includes or depends on third-party software:
+
+Tauri (Apache-2.0/MIT), React (MIT), Vite (MIT)
+
+For a complete list of dependencies and their licenses, see the project's
+dependency manifest file.

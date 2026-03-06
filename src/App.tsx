@@ -1,15 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
 
+const IS_TAURI = !!(window as any).__TAURI__?.core?.invoke;
+
 const invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> =
   (window as any).__TAURI__?.core?.invoke ??
   (async (cmd: string) => {
+    console.warn(`[Streamline Desktop] Tauri not available — "${cmd}" returns mock data`);
     if (cmd === "get_server_status") return { running: false, kafka_port: 9092, http_port: 9094 };
     if (cmd === "get_topics") return [];
     if (cmd === "get_server_info") return { version: "0.2.0", uptime: 0, topics: 0, messages: 0 };
     return {};
   });
 
-type Tab = "dashboard" | "topics" | "produce" | "consume" | "settings";
+type Tab = "dashboard" | "topics" | "produce" | "consume" | "groups" | "schemas" | "settings";
 
 interface ServerStatus {
   running: boolean;
@@ -36,6 +39,51 @@ interface Settings {
   httpPort: number;
   dataDir: string;
   logLevel: string;
+}
+
+interface ConsumerGroupInfo {
+  group_id: string;
+  state: string;
+  members: number;
+  topics: string[];
+}
+
+interface ConsumerGroupDetail {
+  group_id: string;
+  state: string;
+  protocol: string;
+  members: GroupMember[];
+  offsets: GroupOffset[];
+}
+
+interface GroupMember {
+  member_id: string;
+  client_id: string;
+  host: string;
+  assignments: string[];
+}
+
+interface GroupOffset {
+  topic: string;
+  partition: number;
+  current_offset: number;
+  log_end_offset: number;
+  lag: number;
+}
+
+interface SchemaSubject {
+  subject: string;
+  version: number;
+  schema_type: string;
+}
+
+interface SchemaDetail {
+  subject: string;
+  version: number;
+  id: number;
+  schema_type: string;
+  schema: string;
+  compatibility: string;
 }
 
 const COLORS = {
@@ -80,7 +128,9 @@ export default function App() {
         const info = (await invoke("get_server_info")) as ServerInfo;
         setServerInfo(info);
       }
-    } catch { /* outside Tauri */ }
+    } catch (e) {
+      if (IS_TAURI) console.error("[Streamline Desktop] refresh failed:", e);
+    }
   }, []);
 
   useEffect(() => {
@@ -88,7 +138,9 @@ export default function App() {
     // Load persisted settings on startup
     invoke("load_settings").then((s: any) => {
       if (s) setSettings({ kafkaPort: s.kafka_port, httpPort: s.http_port, dataDir: s.data_dir, logLevel: s.log_level });
-    }).catch(() => {});
+    }).catch((e: unknown) => {
+      if (IS_TAURI) console.error("[Streamline Desktop] load_settings failed:", e);
+    });
     const poll = setInterval(refreshData, 5000);
     return () => clearInterval(poll);
   }, [refreshData]);
@@ -101,7 +153,9 @@ export default function App() {
         await invoke("start_server");
       }
       setTimeout(refreshData, 1000);
-    } catch { /* ignore */ }
+    } catch (e) {
+      if (IS_TAURI) console.error("[Streamline Desktop] start/stop failed:", e);
+    }
   };
 
   const handleProduce = async () => {
@@ -125,7 +179,10 @@ export default function App() {
         offset: number;
       }>;
       setConsumeMessages(Array.isArray(msgs) ? msgs : []);
-    } catch { setConsumeMessages([]); }
+    } catch (e) {
+      if (IS_TAURI) console.error("[Streamline Desktop] consume failed:", e);
+      setConsumeMessages([]);
+    }
   };
 
   const formatUptime = (seconds: number) => {
@@ -141,6 +198,8 @@ export default function App() {
     { id: "topics", label: "Topics", icon: "📋" },
     { id: "produce", label: "Produce", icon: "📤" },
     { id: "consume", label: "Consume", icon: "📥" },
+    { id: "groups", label: "Groups", icon: "👥" },
+    { id: "schemas", label: "Schemas", icon: "📐" },
     { id: "settings", label: "Settings", icon: "⚙️" },
   ];
 
@@ -207,6 +266,8 @@ export default function App() {
             topics={topics}
           />
         )}
+        {tab === "groups" && <ConsumerGroupsTab />}
+        {tab === "schemas" && <SchemasTab />}
         {tab === "settings" && <SettingsTab settings={settings} setSettings={setSettings} />}
       </main>
     </div>
@@ -279,7 +340,9 @@ function TopicsTab({ topics, onRefresh }: { topics: TopicInfo[]; onRefresh: () =
       setNewTopicName("");
       setNewTopicPartitions(1);
       onRefresh();
-    } catch { /* ignore */ }
+    } catch (e) {
+      console.error("[Streamline Desktop] create topic failed:", e);
+    }
   };
 
   return (
@@ -378,6 +441,17 @@ function ConsumeTab({ topic, setTopic, messages, onFetch, topics }: {
   messages: Array<{ key: string; value: string; offset: number }>;
   onFetch: () => void; topics: TopicInfo[];
 }) {
+  const [expandedRow, setExpandedRow] = useState<number | null>(null);
+
+  const formatValue = (value: string): { formatted: string; isJson: boolean } => {
+    try {
+      const parsed = JSON.parse(value);
+      return { formatted: JSON.stringify(parsed, null, 2), isJson: true };
+    } catch {
+      return { formatted: value, isJson: false };
+    }
+  };
+
   return (
     <div>
       <h2 style={{ marginTop: 0, fontSize: 24, fontWeight: 600 }}>Consume Messages</h2>
@@ -410,16 +484,359 @@ function ConsumeTab({ topic, setTopic, messages, onFetch, topics }: {
             {messages.length === 0 ? (
               <tr><td colSpan={3} style={{ ...tdStyle, color: COLORS.textDim, textAlign: "center" }}>No messages</td></tr>
             ) : (
-              messages.map((m, i) => (
-                <tr key={i} style={{ borderBottom: `1px solid ${COLORS.border}` }}>
-                  <td style={{ ...tdStyle, width: 80 }}>{m.offset}</td>
-                  <td style={{ ...tdStyle, width: 150, color: COLORS.textDim }}>{m.key || "—"}</td>
-                  <td style={{ ...tdStyle, maxWidth: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.value}</td>
-                </tr>
-              ))
+              messages.map((m, i) => {
+                const { formatted, isJson } = formatValue(m.value);
+                const isExpanded = expandedRow === i;
+                return (
+                  <tr
+                    key={i}
+                    style={{ borderBottom: `1px solid ${COLORS.border}`, cursor: isJson ? "pointer" : "default", verticalAlign: "top" }}
+                    onClick={() => isJson && setExpandedRow(isExpanded ? null : i)}
+                  >
+                    <td style={{ ...tdStyle, width: 80 }}>{m.offset}</td>
+                    <td style={{ ...tdStyle, width: 150, color: COLORS.textDim }}>{m.key || "—"}</td>
+                    <td style={{ ...tdStyle, maxWidth: 500 }}>
+                      {isExpanded ? (
+                        <pre style={{ margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", color: COLORS.green, fontSize: 12 }}>
+                          {formatted}
+                        </pre>
+                      ) : (
+                        <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "flex", alignItems: "center", gap: 6 }}>
+                          {isJson && <span style={{ color: COLORS.blue, fontSize: 10 }}>JSON</span>}
+                          {m.value}
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })
             )}
           </tbody>
         </table>
+      </div>
+    </div>
+  );
+}
+
+// -- Consumer Groups Tab --
+
+function ConsumerGroupsTab() {
+  const [groups, setGroups] = useState<ConsumerGroupInfo[]>([]);
+  const [selectedGroup, setSelectedGroup] = useState<ConsumerGroupDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchGroups = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = (await invoke("list_consumer_groups")) as ConsumerGroupInfo[];
+      setGroups(Array.isArray(result) ? result : []);
+    } catch (e) {
+      setError(String(e));
+      setGroups([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const describeGroup = async (groupId: string) => {
+    try {
+      const detail = (await invoke("describe_consumer_group", { groupId })) as ConsumerGroupDetail;
+      setSelectedGroup(detail);
+    } catch (e) {
+      setError(`Failed to describe group: ${e}`);
+    }
+  };
+
+  const deleteGroup = async (groupId: string) => {
+    try {
+      await invoke("delete_consumer_group", { groupId });
+      setSelectedGroup(null);
+      fetchGroups();
+    } catch (e) {
+      setError(`Failed to delete group: ${e}`);
+    }
+  };
+
+  useEffect(() => { fetchGroups(); }, []);
+
+  const stateColor = (state: string) => {
+    switch (state.toLowerCase()) {
+      case "stable": return COLORS.green;
+      case "preparing_rebalance":
+      case "completing_rebalance": return COLORS.yellow;
+      case "empty": return COLORS.textDim;
+      case "dead": return COLORS.red;
+      default: return COLORS.textDim;
+    }
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 24 }}>
+        <h2 style={{ marginTop: 0, marginBottom: 0, fontSize: 24, fontWeight: 600 }}>Consumer Groups</h2>
+        <button onClick={fetchGroups} style={{ ...btnStyle, padding: "6px 14px", fontSize: 13 }}>
+          {loading ? "Loading…" : "Refresh"}
+        </button>
+      </div>
+
+      {error && (
+        <div style={{ background: "#3e1a1a", borderRadius: 8, padding: 12, marginBottom: 16, color: COLORS.red, fontSize: 13 }}>
+          {error}
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: selectedGroup ? "1fr 1fr" : "1fr", gap: 16 }}>
+        {/* Groups list */}
+        <div style={{ background: COLORS.card, borderRadius: 8, overflow: "hidden" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+            <thead>
+              <tr style={{ borderBottom: `1px solid ${COLORS.border}`, textAlign: "left" }}>
+                <th style={thStyle}>Group ID</th>
+                <th style={thStyle}>State</th>
+                <th style={thStyle}>Members</th>
+              </tr>
+            </thead>
+            <tbody>
+              {groups.length === 0 ? (
+                <tr><td colSpan={3} style={{ ...tdStyle, color: COLORS.textDim, textAlign: "center" }}>No consumer groups</td></tr>
+              ) : (
+                groups.map((g: ConsumerGroupInfo) => (
+                  <tr
+                    key={g.group_id}
+                    onClick={() => describeGroup(g.group_id)}
+                    style={{
+                      borderBottom: `1px solid ${COLORS.border}`,
+                      cursor: "pointer",
+                      background: selectedGroup?.group_id === g.group_id ? COLORS.active : "transparent",
+                    }}
+                  >
+                    <td style={tdStyle}>{g.group_id}</td>
+                    <td style={tdStyle}>
+                      <span style={{ color: stateColor(g.state), fontWeight: 600, fontSize: 12 }}>{g.state}</span>
+                    </td>
+                    <td style={tdStyle}>{g.members}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Group detail panel */}
+        {selectedGroup && (
+          <div style={{ background: COLORS.card, borderRadius: 8, padding: 20 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <h3 style={{ margin: 0, fontSize: 16 }}>{selectedGroup.group_id}</h3>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => deleteGroup(selectedGroup.group_id)}
+                  style={{ ...btnStyle, background: COLORS.red, padding: "4px 12px", fontSize: 12 }}
+                >
+                  Delete
+                </button>
+                <button
+                  onClick={() => setSelectedGroup(null)}
+                  style={{ ...btnStyle, background: "transparent", border: `1px solid ${COLORS.border}`, padding: "4px 12px", fontSize: 12 }}
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+
+            <InfoRow label="State" value={selectedGroup.state} />
+            <InfoRow label="Protocol" value={selectedGroup.protocol || "—"} />
+            <InfoRow label="Members" value={String(selectedGroup.members?.length ?? 0)} />
+
+            {selectedGroup.members && selectedGroup.members.length > 0 && (
+              <div style={{ marginTop: 16 }}>
+                <h4 style={{ margin: "0 0 8px", fontSize: 13, color: COLORS.textDim }}>Members</h4>
+                {selectedGroup.members.map((m: GroupMember) => (
+                  <div key={m.member_id} style={{ background: COLORS.bg, borderRadius: 6, padding: 10, marginBottom: 8, fontSize: 12 }}>
+                    <div style={{ fontWeight: 600 }}>{m.client_id}</div>
+                    <div style={{ color: COLORS.textDim, marginTop: 2 }}>{m.host}</div>
+                    {m.assignments && m.assignments.length > 0 && (
+                      <div style={{ marginTop: 4, color: COLORS.blue }}>
+                        {m.assignments.join(", ")}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {selectedGroup.offsets && selectedGroup.offsets.length > 0 && (
+              <div style={{ marginTop: 16 }}>
+                <h4 style={{ margin: "0 0 8px", fontSize: 13, color: COLORS.textDim }}>Partition Offsets</h4>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, fontFamily: "monospace" }}>
+                  <thead>
+                    <tr style={{ borderBottom: `1px solid ${COLORS.border}` }}>
+                      <th style={{ ...thStyle, padding: "6px 8px" }}>Topic</th>
+                      <th style={{ ...thStyle, padding: "6px 8px" }}>Part</th>
+                      <th style={{ ...thStyle, padding: "6px 8px" }}>Offset</th>
+                      <th style={{ ...thStyle, padding: "6px 8px" }}>End</th>
+                      <th style={{ ...thStyle, padding: "6px 8px" }}>Lag</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedGroup.offsets.map((o: GroupOffset, i: number) => (
+                      <tr key={i} style={{ borderBottom: `1px solid ${COLORS.border}` }}>
+                        <td style={{ padding: "4px 8px" }}>{o.topic}</td>
+                        <td style={{ padding: "4px 8px" }}>{o.partition}</td>
+                        <td style={{ padding: "4px 8px" }}>{o.current_offset}</td>
+                        <td style={{ padding: "4px 8px" }}>{o.log_end_offset}</td>
+                        <td style={{ padding: "4px 8px", color: o.lag > 0 ? COLORS.yellow : COLORS.green, fontWeight: 600 }}>
+                          {o.lag}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// -- Schemas Tab --
+
+function SchemasTab() {
+  const [subjects, setSubjects] = useState<SchemaSubject[]>([]);
+  const [selectedSchema, setSelectedSchema] = useState<SchemaDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchSubjects = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = (await invoke("list_schemas")) as SchemaSubject[];
+      setSubjects(Array.isArray(result) ? result : []);
+    } catch (e) {
+      setError(String(e));
+      setSubjects([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const viewSchema = async (subject: string) => {
+    try {
+      const detail = (await invoke("get_schema", { subject })) as SchemaDetail;
+      setSelectedSchema(detail);
+    } catch (e) {
+      setError(`Failed to load schema: ${e}`);
+    }
+  };
+
+  useEffect(() => { fetchSubjects(); }, []);
+
+  const formatSchema = (schema: string): string => {
+    try {
+      return JSON.stringify(JSON.parse(schema), null, 2);
+    } catch {
+      return schema;
+    }
+  };
+
+  const typeColor = (schemaType: string) => {
+    switch (schemaType?.toUpperCase()) {
+      case "AVRO": return COLORS.green;
+      case "PROTOBUF": return COLORS.blue;
+      case "JSON": return COLORS.yellow;
+      default: return COLORS.textDim;
+    }
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 24 }}>
+        <h2 style={{ marginTop: 0, marginBottom: 0, fontSize: 24, fontWeight: 600 }}>Schema Registry</h2>
+        <button onClick={fetchSubjects} style={{ ...btnStyle, padding: "6px 14px", fontSize: 13 }}>
+          {loading ? "Loading…" : "Refresh"}
+        </button>
+      </div>
+
+      {error && (
+        <div style={{ background: "#3e1a1a", borderRadius: 8, padding: 12, marginBottom: 16, color: COLORS.red, fontSize: 13 }}>
+          {error}
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: selectedSchema ? "350px 1fr" : "1fr", gap: 16 }}>
+        {/* Subjects list */}
+        <div style={{ background: COLORS.card, borderRadius: 8, overflow: "hidden" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+            <thead>
+              <tr style={{ borderBottom: `1px solid ${COLORS.border}`, textAlign: "left" }}>
+                <th style={thStyle}>Subject</th>
+                <th style={thStyle}>Type</th>
+              </tr>
+            </thead>
+            <tbody>
+              {subjects.length === 0 ? (
+                <tr><td colSpan={2} style={{ ...tdStyle, color: COLORS.textDim, textAlign: "center" }}>No schemas registered</td></tr>
+              ) : (
+                subjects.map((s: SchemaSubject) => (
+                  <tr
+                    key={s.subject}
+                    onClick={() => viewSchema(s.subject)}
+                    style={{
+                      borderBottom: `1px solid ${COLORS.border}`,
+                      cursor: "pointer",
+                      background: selectedSchema?.subject === s.subject ? COLORS.active : "transparent",
+                    }}
+                  >
+                    <td style={tdStyle}>{s.subject}</td>
+                    <td style={tdStyle}>
+                      {s.schema_type && (
+                        <span style={{ color: typeColor(s.schema_type), fontWeight: 600, fontSize: 12 }}>
+                          {s.schema_type}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Schema detail panel */}
+        {selectedSchema && (
+          <div style={{ background: COLORS.card, borderRadius: 8, padding: 20 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+              <h3 style={{ margin: 0, fontSize: 16 }}>{selectedSchema.subject}</h3>
+              <button
+                onClick={() => setSelectedSchema(null)}
+                style={{ ...btnStyle, background: "transparent", border: `1px solid ${COLORS.border}`, padding: "4px 12px", fontSize: 12 }}
+              >
+                Close
+              </button>
+            </div>
+
+            <InfoRow label="Schema ID" value={String(selectedSchema.id)} />
+            <InfoRow label="Version" value={String(selectedSchema.version)} />
+            <InfoRow label="Type" value={selectedSchema.schema_type || "—"} />
+            {selectedSchema.compatibility && <InfoRow label="Compatibility" value={selectedSchema.compatibility} />}
+
+            <div style={{ marginTop: 16 }}>
+              <div style={{ fontSize: 13, color: COLORS.textDim, marginBottom: 8 }}>Schema Definition</div>
+              <pre style={{
+                background: COLORS.bg, borderRadius: 8, padding: 16,
+                fontSize: 12, fontFamily: "monospace", overflow: "auto",
+                maxHeight: 400, margin: 0, whiteSpace: "pre-wrap", wordBreak: "break-word",
+                color: COLORS.green, border: `1px solid ${COLORS.border}`,
+              }}>
+                {formatSchema(selectedSchema.schema)}
+              </pre>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -442,7 +859,9 @@ function SettingsTab({ settings, setSettings }: { settings: Settings; setSetting
       });
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
-    } catch { /* ignore */ }
+    } catch (e) {
+      console.error("[Streamline Desktop] save settings failed:", e);
+    }
   };
 
   return (
