@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useRef } from "react";
 
 const IS_TAURI = !!(window as any).__TAURI__?.core?.invoke;
 
@@ -13,6 +13,12 @@ const invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> 
   });
 
 type Tab = "dashboard" | "topics" | "produce" | "consume" | "groups" | "schemas" | "settings";
+
+interface Toast {
+  id: number;
+  message: string;
+  type: "error" | "success" | "info";
+}
 
 interface ServerStatus {
   running: boolean;
@@ -107,6 +113,14 @@ export default function App() {
   const [topics, setTopics] = useState<TopicInfo[]>([]);
   const [serverInfo, setServerInfo] = useState<ServerInfo>({ version: "0.2.0", uptime: 0, topics: 0, messages: 0 });
   const [settings, setSettings] = useState<Settings>({ kafkaPort: 9092, httpPort: 9094, dataDir: "", logLevel: "info" });
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const toastIdRef = useRef(0);
+
+  const showToast = useCallback((message: string, type: Toast["type"] = "error") => {
+    const id = ++toastIdRef.current;
+    setToasts((prev) => [...prev, { id, message, type }]);
+    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 5000);
+  }, []);
 
   // Produce state
   const [produceTopic, setProduceTopic] = useState("");
@@ -130,6 +144,7 @@ export default function App() {
       }
     } catch (e) {
       if (IS_TAURI) console.error("[Streamline Desktop] refresh failed:", e);
+      showToast(`Refresh failed: ${e}`, "error");
     }
   }, []);
 
@@ -154,7 +169,7 @@ export default function App() {
       }
       setTimeout(refreshData, 1000);
     } catch (e) {
-      if (IS_TAURI) console.error("[Streamline Desktop] start/stop failed:", e);
+      showToast(`Failed to ${status.running ? "stop" : "start"} server: ${e}`, "error");
     }
   };
 
@@ -163,10 +178,12 @@ export default function App() {
     try {
       await invoke("produce_message", { topic: produceTopic, key: produceKey || null, value: produceValue });
       setProduceStatus("✓ Message sent");
+      showToast("Message sent successfully", "success");
       setProduceValue("");
       setTimeout(() => setProduceStatus(null), 3000);
     } catch (e) {
       setProduceStatus(`✗ Failed: ${e}`);
+      showToast(`Produce failed: ${e}`, "error");
     }
   };
 
@@ -180,7 +197,7 @@ export default function App() {
       }>;
       setConsumeMessages(Array.isArray(msgs) ? msgs : []);
     } catch (e) {
-      if (IS_TAURI) console.error("[Streamline Desktop] consume failed:", e);
+      showToast(`Consume failed: ${e}`, "error");
       setConsumeMessages([]);
     }
   };
@@ -204,7 +221,31 @@ export default function App() {
   ];
 
   return (
-    <div style={{ display: "flex", height: "100vh", fontFamily: "system-ui, -apple-system, sans-serif" }}>
+    <div style={{ display: "flex", height: "100vh", fontFamily: "system-ui, -apple-system, sans-serif", position: "relative" }}>
+      {/* Toast notifications */}
+      <div style={{ position: "fixed", top: 16, right: 16, zIndex: 9999, display: "flex", flexDirection: "column", gap: 8 }}>
+        {toasts.map((t) => (
+          <div
+            key={t.id}
+            style={{
+              padding: "12px 20px",
+              borderRadius: 8,
+              color: "#fff",
+              fontSize: 13,
+              fontWeight: 500,
+              maxWidth: 360,
+              boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+              background: t.type === "error" ? COLORS.red : t.type === "success" ? COLORS.green : COLORS.blue,
+              cursor: "pointer",
+              animation: "fadeIn 0.2s ease-out",
+            }}
+            onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
+          >
+            {t.type === "error" ? "✗ " : t.type === "success" ? "✓ " : "ℹ "}{t.message}
+          </div>
+        ))}
+      </div>
+
       {/* Sidebar */}
       <aside style={{ width: 220, background: COLORS.sidebar, color: COLORS.text, display: "flex", flexDirection: "column", padding: "16px 0", borderRight: `1px solid ${COLORS.border}` }}>
         <div style={{ padding: "0 16px 24px", fontSize: 18, fontWeight: 700 }}>⚡ Streamline</div>
