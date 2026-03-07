@@ -579,3 +579,24 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running Streamline Desktop");
 }
+
+
+/// Application-level error type for Tauri commands.
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+    #[error("Connection failed: {0}")]
+    ConnectionFailed(String),
+    #[error("Operation timed out")]
+    Timeout,
+    #[error("Internal error: {0}")]
+    Internal(String),
+}
+
+impl serde::Serialize for AppError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
