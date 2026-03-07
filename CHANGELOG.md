@@ -6,12 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
-- style: align sidebar icons with design system (2026-03-05)
-
-- refactor: migrate state management to zustand (2026-03-06)
-
-- fix: resolve dark mode rendering issue on macOS (2026-03-06)
 ## [Unreleased]
+
+### Added
+- Toast notification system for operation success/failure feedback
+- Error toasts on server start/stop, produce, consume, and refresh failures
+- Success toasts on message produce
+- Click-to-dismiss toast behavior with 5-second auto-expiry
+
+### Changed
+- style: align sidebar icons with design system (2026-03-05)
+- refactor: migrate state management to zustand (2026-03-06)
+- fix: resolve dark mode rendering issue on macOS (2026-03-06)
 
 ## [0.2.0] - 2026-02-28
 
