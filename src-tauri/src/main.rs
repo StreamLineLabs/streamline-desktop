@@ -600,3 +600,26 @@ impl serde::Serialize for AppError {
         serializer.serialize_str(&self.to_string())
     }
 }
+
+
+/// TLS settings managed through the desktop app UI.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TlsSettings {
+    enabled: bool,
+    ca_cert_path: Option<String>,
+    client_cert_path: Option<String>,
+    client_key_path: Option<String>,
+    skip_verify: bool,
+}
+
+impl Default for TlsSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ca_cert_path: None,
+            client_cert_path: None,
+            client_key_path: None,
+            skip_verify: false,
+        }
+    }
+}
