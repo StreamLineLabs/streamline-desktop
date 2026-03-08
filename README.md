@@ -62,3 +62,19 @@ streamline-desktop/
 Apache-2.0
 
 
+
+
+## Development Setup
+
+### Prerequisites
+- Node.js 18+
+- Rust 1.80+
+- Tauri CLI: `cargo install tauri-cli`
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `STREAMLINE_DEFAULT_BROKER` | Default broker address | `localhost:9092` |
+| `STREAMLINE_THEME` | UI theme (light/dark/system) | `system` |
+| `STREAMLINE_LOG_LEVEL` | Log verbosity | `info` |
