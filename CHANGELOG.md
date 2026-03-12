@@ -13,8 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Error toasts on server start/stop, produce, consume, and refresh failures
 - Success toasts on message produce
 - Click-to-dismiss toast behavior with 5-second auto-expiry
+- `reqwest` HTTP client replacing curl subprocess calls for all server communication
 
 ### Changed
+- Replace curl-based HTTP helpers (`reqwest_get`, `reqwest_post`, `reqwest_delete`) with native `reqwest` 0.12 client
 - style: align sidebar icons with design system (2026-03-05)
 - refactor: migrate state management to zustand (2026-03-06)
 - fix: resolve dark mode rendering issue on macOS (2026-03-06)
