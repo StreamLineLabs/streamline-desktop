@@ -81,7 +81,15 @@ fn dirs_next_data_dir() -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 fn streamline_binary_path() -> PathBuf {
-    // Bundled alongside the app via tauri.conf.json `bundle.resources`.
+    // 1. Check STREAMLINE_BINARY env var (explicit override)
+    if let Ok(env_path) = std::env::var("STREAMLINE_BINARY") {
+        let p = PathBuf::from(env_path);
+        if p.exists() {
+            return p;
+        }
+    }
+
+    // 2. Check bundled location (Tauri resource bundle)
     let mut path = std::env::current_exe().unwrap_or_default();
     path.pop(); // remove binary name
     #[cfg(target_os = "macos")]
@@ -91,6 +99,24 @@ fn streamline_binary_path() -> PathBuf {
         path.push("Resources");
     }
     path.push("streamline");
+    if path.exists() {
+        return path;
+    }
+
+    // 3. Fall back to PATH lookup
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("streamline")
+        .output()
+    {
+        if output.status.success() {
+            let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !found.is_empty() {
+                return PathBuf::from(found);
+            }
+        }
+    }
+
+    // Return the bundled path (will produce a clear error in spawn_server)
     path
 }
 
@@ -267,55 +293,57 @@ async fn get_server_info(state: State<'_, ServerState>) -> Result<ServerInfo, St
     serde_json::from_str::<ServerInfo>(&body).map_err(|e| e.to_string())
 }
 
-/// Minimal HTTP GET without pulling in reqwest — uses the Tauri plugin-shell or
-/// falls back to a blocking TCP request. For simplicity we shell out to curl.
+/// HTTP GET using reqwest client.
 async fn reqwest_get(url: &str) -> Result<String, String> {
-    let output = tokio::process::Command::new("curl")
-        .args(["-sf", url])
-        .output()
+    let response = reqwest::get(url)
         .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
+        .map_err(|e| format!("HTTP GET failed: {e}"))?;
 
-    if !output.status.success() {
-        return Err(format!(
-            "HTTP {} from {}",
-            output.status.code().unwrap_or(-1),
-            url
-        ));
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP {status} from {url}: {body}"));
     }
-    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+
+    response.text().await.map_err(|e| format!("Failed to read response body: {e}"))
 }
 
-/// HTTP POST helper.
+/// HTTP POST helper using reqwest client.
 async fn reqwest_post(url: &str, body: &str) -> Result<String, String> {
-    let output = tokio::process::Command::new("curl")
-        .args(["-sf", "-X", "POST", "-H", "Content-Type: application/json", "-d", body, url])
-        .output()
+    let client = reqwest::Client::new();
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .body(body.to_owned())
+        .send()
         .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
+        .map_err(|e| format!("HTTP POST failed: {e}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("HTTP POST failed ({}): {}", output.status.code().unwrap_or(-1), stderr));
+    if !response.status().is_success() {
+        let status = response.status();
+        let err_body = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP POST {status}: {err_body}"));
     }
-    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+
+    response.text().await.map_err(|e| format!("Failed to read response body: {e}"))
 }
 
-/// HTTP DELETE helper.
+/// HTTP DELETE helper using reqwest client.
 async fn reqwest_delete(url: &str) -> Result<String, String> {
-    let output = tokio::process::Command::new("curl")
-        .args(["-sf", "-X", "DELETE", url])
-        .output()
+    let client = reqwest::Client::new();
+    let response = client
+        .delete(url)
+        .send()
         .await
-        .map_err(|e| format!("HTTP request failed: {e}"))?;
+        .map_err(|e| format!("HTTP DELETE failed: {e}"))?;
 
-    if !output.status.success() {
-        return Err(format!(
-            "HTTP DELETE failed ({})",
-            output.status.code().unwrap_or(-1),
-        ));
+    if !response.status().is_success() {
+        let status = response.status();
+        let err_body = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP DELETE {status}: {err_body}"));
     }
-    String::from_utf8(output.stdout).map_err(|e| e.to_string())
+
+    response.text().await.map_err(|e| format!("Failed to read response body: {e}"))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -621,5 +649,219 @@ impl Default for TlsSettings {
             client_key_path: None,
             skip_verify: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_config_default_ports() {
+        let config = ServerConfig::default();
+        assert_eq!(config.kafka_port, 9092);
+        assert_eq!(config.http_port, 9094);
+    }
+
+    #[test]
+    fn test_server_config_default_log_level() {
+        let config = ServerConfig::default();
+        assert_eq!(config.log_level, "info");
+    }
+
+    #[test]
+    fn test_server_config_serialization_roundtrip() {
+        let config = ServerConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: ServerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.kafka_port, config.kafka_port);
+        assert_eq!(parsed.http_port, config.http_port);
+        assert_eq!(parsed.log_level, config.log_level);
+    }
+
+    #[test]
+    fn test_tls_settings_default() {
+        let tls = TlsSettings::default();
+        assert!(!tls.enabled);
+        assert!(tls.ca_cert_path.is_none());
+        assert!(tls.client_cert_path.is_none());
+        assert!(tls.client_key_path.is_none());
+        assert!(!tls.skip_verify);
+    }
+
+    #[test]
+    fn test_tls_settings_serialization_roundtrip() {
+        let tls = TlsSettings {
+            enabled: true,
+            ca_cert_path: Some("/path/to/ca.pem".into()),
+            client_cert_path: Some("/path/to/cert.pem".into()),
+            client_key_path: Some("/path/to/key.pem".into()),
+            skip_verify: false,
+        };
+        let json = serde_json::to_string(&tls).unwrap();
+        let parsed: TlsSettings = serde_json::from_str(&json).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.ca_cert_path.unwrap(), "/path/to/ca.pem");
+    }
+
+    #[test]
+    fn test_server_status_serialization() {
+        let status = ServerStatus {
+            running: true,
+            pid: Some(1234),
+            kafka_port: 9092,
+            http_port: 9094,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"running\":true"));
+        assert!(json.contains("\"pid\":1234"));
+        assert!(json.contains("\"kafka_port\":9092"));
+        assert!(json.contains("\"http_port\":9094"));
+    }
+
+    #[test]
+    fn test_server_status_stopped() {
+        let status = ServerStatus {
+            running: false,
+            pid: None,
+            kafka_port: 9092,
+            http_port: 9094,
+        };
+        assert!(!status.running);
+        assert!(status.pid.is_none());
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("\"running\":false"));
+    }
+
+    #[test]
+    fn test_topic_info_serialization() {
+        let topic = TopicInfo {
+            name: "events".into(),
+            partitions: 3,
+        };
+        let json = serde_json::to_string(&topic).unwrap();
+        assert!(json.contains("\"name\":\"events\""));
+        assert!(json.contains("\"partitions\":3"));
+    }
+
+    #[test]
+    fn test_consumed_message_serialization() {
+        let msg = ConsumedMessage {
+            key: "k1".into(),
+            value: "hello world".into(),
+            offset: 42,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: ConsumedMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.key, "k1");
+        assert_eq!(parsed.value, "hello world");
+        assert_eq!(parsed.offset, 42);
+    }
+
+    #[test]
+    fn test_consumed_message_empty_key() {
+        let msg = ConsumedMessage {
+            key: String::new(),
+            value: "data".into(),
+            offset: 0,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"key\":\"\""));
+    }
+
+    #[test]
+    fn test_consumer_group_info_serialization() {
+        let group = ConsumerGroupInfo {
+            group_id: "my-group".into(),
+            state: "Stable".into(),
+            members: 2,
+            topics: vec!["events".into(), "logs".into()],
+        };
+        let json = serde_json::to_string(&group).unwrap();
+        let parsed: ConsumerGroupInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.group_id, "my-group");
+        assert_eq!(parsed.topics.len(), 2);
+    }
+
+    #[test]
+    fn test_group_offset_lag_calculation_data() {
+        let offset = GroupOffset {
+            topic: "events".into(),
+            partition: 0,
+            current_offset: 100,
+            log_end_offset: 150,
+            lag: 50,
+        };
+        assert_eq!(offset.log_end_offset - offset.current_offset, offset.lag);
+    }
+
+    #[test]
+    fn test_schema_detail_serialization() {
+        let schema = SchemaDetail {
+            subject: "events-value".into(),
+            version: 1,
+            id: 42,
+            schema_type: "AVRO".into(),
+            schema: r#"{"type":"record","name":"Event"}"#.into(),
+            compatibility: "BACKWARD".into(),
+        };
+        let json = serde_json::to_string(&schema).unwrap();
+        let parsed: SchemaDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.subject, "events-value");
+        assert_eq!(parsed.schema_type, "AVRO");
+    }
+
+    #[test]
+    fn test_consumer_group_detail_roundtrip() {
+        let detail = ConsumerGroupDetail {
+            group_id: "grp-1".into(),
+            state: "Stable".into(),
+            protocol: "range".into(),
+            members: vec![GroupMember {
+                member_id: "m1".into(),
+                client_id: "c1".into(),
+                host: "127.0.0.1".into(),
+                assignments: vec!["events-0".into()],
+            }],
+            offsets: vec![GroupOffset {
+                topic: "events".into(),
+                partition: 0,
+                current_offset: 50,
+                log_end_offset: 100,
+                lag: 50,
+            }],
+        };
+        let json = serde_json::to_string(&detail).unwrap();
+        let parsed: ConsumerGroupDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.members.len(), 1);
+        assert_eq!(parsed.offsets.len(), 1);
+        assert_eq!(parsed.offsets[0].lag, 50);
+    }
+
+    #[test]
+    fn test_schema_subject_deserialization() {
+        let json = r#"{"subject":"events-value","version":1,"schema_type":"AVRO"}"#;
+        let parsed: SchemaSubject = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.subject, "events-value");
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.schema_type, "AVRO");
+    }
+
+    #[test]
+    fn test_schema_subject_defaults() {
+        let json = r#"{"subject":"events-key"}"#;
+        let parsed: SchemaSubject = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.subject, "events-key");
+        assert_eq!(parsed.version, 0);
+        assert_eq!(parsed.schema_type, "");
+    }
+
+    #[test]
+    fn test_default_data_dir_is_not_empty() {
+        let dir = default_data_dir();
+        assert!(
+            !dir.is_empty(),
+            "default_data_dir should return a non-empty string"
+        );
     }
 }

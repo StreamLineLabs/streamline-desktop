@@ -1,111 +1,10 @@
 import { useCallback, useEffect, useState, useRef } from "react";
-
-const IS_TAURI = !!(window as any).__TAURI__?.core?.invoke;
-
-const invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> =
-  (window as any).__TAURI__?.core?.invoke ??
-  (async (cmd: string) => {
-    console.warn(`[Streamline Desktop] Tauri not available — "${cmd}" returns mock data`);
-    if (cmd === "get_server_status") return { running: false, kafka_port: 9092, http_port: 9094 };
-    if (cmd === "get_topics") return [];
-    if (cmd === "get_server_info") return { version: "0.2.0", uptime: 0, topics: 0, messages: 0 };
-    return {};
-  });
-
-type Tab = "dashboard" | "topics" | "produce" | "consume" | "groups" | "schemas" | "settings";
-
-interface Toast {
-  id: number;
-  message: string;
-  type: "error" | "success" | "info";
-}
-
-interface ServerStatus {
-  running: boolean;
-  pid?: number;
-  kafka_port: number;
-  http_port: number;
-}
-
-interface TopicInfo {
-  name: string;
-  partitions: number;
-  messages: number;
-}
-
-interface ServerInfo {
-  version: string;
-  uptime: number;
-  topics: number;
-  messages: number;
-}
-
-interface Settings {
-  kafkaPort: number;
-  httpPort: number;
-  dataDir: string;
-  logLevel: string;
-}
-
-interface ConsumerGroupInfo {
-  group_id: string;
-  state: string;
-  members: number;
-  topics: string[];
-}
-
-interface ConsumerGroupDetail {
-  group_id: string;
-  state: string;
-  protocol: string;
-  members: GroupMember[];
-  offsets: GroupOffset[];
-}
-
-interface GroupMember {
-  member_id: string;
-  client_id: string;
-  host: string;
-  assignments: string[];
-}
-
-interface GroupOffset {
-  topic: string;
-  partition: number;
-  current_offset: number;
-  log_end_offset: number;
-  lag: number;
-}
-
-interface SchemaSubject {
-  subject: string;
-  version: number;
-  schema_type: string;
-}
-
-interface SchemaDetail {
-  subject: string;
-  version: number;
-  id: number;
-  schema_type: string;
-  schema: string;
-  compatibility: string;
-}
-
-const COLORS = {
-  bg: "#0f0f23",
-  sidebar: "#1a1a2e",
-  active: "#16213e",
-  card: "#1a1a2e",
-  border: "#2a2a4a",
-  text: "#eee",
-  textDim: "#888",
-  green: "#4caf50",
-  red: "#f44336",
-  blue: "#2196f3",
-  yellow: "#ff9800",
-  purple: "#9c27b0",
-};
+import {
+  Tab, Toast, ServerStatus, TopicInfo, ServerInfo, Settings,
+  ConsumerGroupInfo, ConsumerGroupDetail, GroupMember, GroupOffset,
+  SchemaSubject, SchemaDetail,
+  COLORS, IS_TAURI, invoke, inputStyle, btnStyle, thStyle, tdStyle,
+} from "./types";
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("dashboard");
@@ -970,30 +869,3 @@ function Input({ value, onChange, placeholder, type }: {
     />
   );
 }
-
-const inputStyle: React.CSSProperties = {
-  width: "100%",
-  padding: "8px 12px",
-  borderRadius: 6,
-  border: `1px solid ${COLORS.border}`,
-  background: COLORS.bg,
-  color: COLORS.text,
-  fontSize: 14,
-  boxSizing: "border-box",
-  outline: "none",
-};
-
-const btnStyle: React.CSSProperties = {
-  padding: "8px 20px",
-  borderRadius: 6,
-  background: COLORS.blue,
-  color: "#fff",
-  border: "none",
-  cursor: "pointer",
-  fontSize: 14,
-  fontWeight: 600,
-  whiteSpace: "nowrap",
-};
-
-const thStyle: React.CSSProperties = { padding: "12px 16px", fontSize: 12, color: COLORS.textDim, fontWeight: 600, textTransform: "uppercase" };
-const tdStyle: React.CSSProperties = { padding: "10px 16px" };
