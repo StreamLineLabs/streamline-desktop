@@ -1,0 +1,17 @@
+# CODEOWNERS for streamline-desktop
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# These owners will be automatically requested for review on pull requests.
+# The last matching pattern takes precedence.
+
+# Default owner for everything in the repo
+* @streamlinelabs/tooling-team
+
+# CI/CD and GitHub configuration
+/.github/ @streamlinelabs/tooling-team @streamlinelabs/maintainers
+
+# Rust backend (Tauri)
+/src-tauri/ @streamlinelabs/tooling-team
+
+# React frontend
+/src/ @streamlinelabs/tooling-team

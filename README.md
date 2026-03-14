@@ -1,5 +1,10 @@
 # Streamline Desktop
 
+[![CI](https://github.com/streamlinelabs/streamline-desktop/actions/workflows/ci.yml/badge.svg)](https://github.com/streamlinelabs/streamline-desktop/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Tauri](https://img.shields.io/badge/Tauri-2.0-24C8D8.svg)](https://v2.tauri.app)
+[![Docs](https://img.shields.io/badge/docs-streamlinelabs.dev-blue.svg)](https://streamlinelabs.dev/docs/getting-started/desktop)
+
 > **The Redis of Streaming — on your desktop.**
 
 Streamline Desktop wraps the [Streamline](https://github.com/streamlinelabs/streamline) server in a native desktop application powered by [Tauri 2](https://v2.tauri.app). It bundles the Streamline binary, manages its lifecycle, and provides a GUI for producing/consuming messages, inspecting topics, and running StreamQL queries.
