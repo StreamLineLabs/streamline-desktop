@@ -101,12 +101,25 @@ export const IS_TAURI = !!(window as any).__TAURI__?.core?.invoke;
 
 export const invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> =
   (window as any).__TAURI__?.core?.invoke ??
-  (async (cmd: string) => {
-    console.warn(`[Streamline Desktop] Tauri not available — "${cmd}" returns mock data`);
-    if (cmd === "get_server_status") return { running: false, kafka_port: 9092, http_port: 9094 };
-    if (cmd === "get_topics") return [];
-    if (cmd === "get_server_info") return { version: "0.2.0", uptime: 0, topics: 0, messages: 0 };
-    return {};
+  (async (cmd: string, args?: Record<string, unknown>) => {
+    console.warn(`[Streamline Desktop] Tauri not available — "${cmd}" returns preview data`);
+    switch (cmd) {
+      case "get_server_status":
+        return { running: false, pid: null, kafka_port: 9092, http_port: 9094 };
+      case "get_topics":
+        return [];
+      case "get_server_info":
+        return { version: "0.2.0 (preview)", uptime_secs: 0, kafka_port: 9092, http_port: 9094 };
+      case "list_consumer_groups":
+        return [];
+      case "list_schemas":
+        return [];
+      case "load_settings":
+        return { kafka_port: 9092, http_port: 9094, data_dir: "./data", log_level: "info" };
+      default:
+        console.error(`[Streamline Desktop] Unhandled command in preview mode: "${cmd}"`);
+        return null;
+    }
   });
 
 // Shared styles
