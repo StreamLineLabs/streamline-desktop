@@ -13,7 +13,7 @@ import type {
   SchemaSubject,
   SchemaDetail,
 } from "../types";
-import { COLORS, inputStyle, btnStyle, thStyle, tdStyle } from "../types";
+import { COLORS, IS_TAURI, invoke, inputStyle, btnStyle, thStyle, tdStyle } from "../types";
 
 describe("Desktop Types", () => {
   it("should satisfy Tab type constraint", () => {
@@ -173,5 +173,158 @@ describe("Desktop Constants", () => {
 
   it("should define tdStyle with padding", () => {
     expect(tdStyle.padding).toBe("10px 16px");
+  });
+});
+
+describe("Preview Mode Invoke Mock", () => {
+  it("IS_TAURI should be false in test environment", () => {
+    expect(IS_TAURI).toBe(false);
+  });
+
+  it("invoke should be a function", () => {
+    expect(typeof invoke).toBe("function");
+  });
+
+  it("get_server_status returns valid ServerStatus", async () => {
+    const result = (await invoke("get_server_status")) as ServerStatus;
+    expect(result).toBeDefined();
+    expect(typeof result.running).toBe("boolean");
+    expect(result.kafka_port).toBe(9092);
+    expect(result.http_port).toBe(9094);
+  });
+
+  it("get_topics returns array of TopicInfo", async () => {
+    const result = (await invoke("get_topics")) as TopicInfo[];
+    expect(Array.isArray(result)).toBe(true);
+    expect(result.length).toBeGreaterThan(0);
+    for (const topic of result) {
+      expect(topic.name).toBeTruthy();
+      expect(typeof topic.partitions).toBe("number");
+      expect(typeof topic.messages).toBe("number");
+    }
+  });
+
+  it("get_server_info returns valid ServerInfo", async () => {
+    const result = (await invoke("get_server_info")) as ServerInfo;
+    expect(result.version).toContain("0.2.0");
+    expect(typeof result.uptime_secs).toBe("number");
+  });
+
+  it("list_consumer_groups returns array of ConsumerGroupInfo", async () => {
+    const result = (await invoke("list_consumer_groups")) as ConsumerGroupInfo[];
+    expect(Array.isArray(result)).toBe(true);
+    expect(result.length).toBeGreaterThan(0);
+    for (const group of result) {
+      expect(group.group_id).toBeTruthy();
+      expect(group.state).toBeTruthy();
+      expect(typeof group.members).toBe("number");
+      expect(Array.isArray(group.topics)).toBe(true);
+    }
+  });
+
+  it("list_schemas returns array of SchemaSubject", async () => {
+    const result = (await invoke("list_schemas")) as SchemaSubject[];
+    expect(Array.isArray(result)).toBe(true);
+    expect(result.length).toBeGreaterThan(0);
+    for (const schema of result) {
+      expect(schema.subject).toBeTruthy();
+      expect(typeof schema.version).toBe("number");
+      expect(schema.schema_type).toBeTruthy();
+    }
+  });
+
+  it("load_settings returns valid Settings", async () => {
+    const result = (await invoke("load_settings")) as Record<string, unknown>;
+    expect(result.kafka_port).toBe(9092);
+    expect(result.http_port).toBe(9094);
+    expect(result.data_dir).toBeTruthy();
+    expect(result.log_level).toBeTruthy();
+  });
+
+  it("start_server returns null without error", async () => {
+    const result = await invoke("start_server");
+    expect(result).toBeNull();
+  });
+
+  it("stop_server returns null without error", async () => {
+    const result = await invoke("stop_server");
+    expect(result).toBeNull();
+  });
+
+  it("produce_message returns null without error", async () => {
+    const result = await invoke("produce_message", {
+      topic: "test",
+      key: "k1",
+      value: "v1",
+    });
+    expect(result).toBeNull();
+  });
+
+  it("consume_messages returns array of messages", async () => {
+    const result = (await invoke("consume_messages", {
+      topic: "test",
+      limit: 50,
+    })) as Array<{ key: string; value: string; offset: number }>;
+    expect(Array.isArray(result)).toBe(true);
+    expect(result.length).toBeGreaterThan(0);
+    for (const msg of result) {
+      expect(typeof msg.key).toBe("string");
+      expect(typeof msg.value).toBe("string");
+      expect(typeof msg.offset).toBe("number");
+    }
+  });
+
+  it("create_topic returns null without error", async () => {
+    const result = await invoke("create_topic", {
+      name: "new-topic",
+      partitions: 3,
+    });
+    expect(result).toBeNull();
+  });
+
+  it("delete_consumer_group returns null without error", async () => {
+    const result = await invoke("delete_consumer_group", {
+      groupId: "test-group",
+    });
+    expect(result).toBeNull();
+  });
+
+  it("describe_consumer_group returns valid detail", async () => {
+    const result = (await invoke("describe_consumer_group", {
+      groupId: "my-group",
+    })) as ConsumerGroupDetail;
+    expect(result.group_id).toBe("my-group");
+    expect(result.state).toBeTruthy();
+    expect(result.protocol).toBeTruthy();
+    expect(Array.isArray(result.members)).toBe(true);
+    expect(result.members.length).toBeGreaterThan(0);
+    expect(result.members[0].member_id).toBeTruthy();
+    expect(Array.isArray(result.offsets)).toBe(true);
+    expect(result.offsets.length).toBeGreaterThan(0);
+    expect(typeof result.offsets[0].lag).toBe("number");
+  });
+
+  it("get_schema returns valid SchemaDetail", async () => {
+    const result = (await invoke("get_schema", {
+      subject: "events-value",
+    })) as SchemaDetail;
+    expect(result.subject).toBe("events-value");
+    expect(typeof result.version).toBe("number");
+    expect(typeof result.id).toBe("number");
+    expect(result.schema_type).toBeTruthy();
+    expect(result.schema).toBeTruthy();
+    expect(result.compatibility).toBeTruthy();
+  });
+
+  it("save_settings returns null without error", async () => {
+    const result = await invoke("save_settings", {
+      settings: { kafka_port: 9092, http_port: 9094, data_dir: "./data", log_level: "debug" },
+    });
+    expect(result).toBeNull();
+  });
+
+  it("unknown command returns null", async () => {
+    const result = await invoke("nonexistent_command");
+    expect(result).toBeNull();
   });
 });

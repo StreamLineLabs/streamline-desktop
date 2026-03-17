@@ -53,3 +53,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - feat: add discriminated union types for streaming event payloads
 - test: verify discriminated union type exhaustiveness
+- chore: update build configuration and type exports

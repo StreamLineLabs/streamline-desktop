@@ -107,15 +107,63 @@ export const invoke: (cmd: string, args?: Record<string, unknown>) => Promise<un
       case "get_server_status":
         return { running: false, pid: null, kafka_port: 9092, http_port: 9094 };
       case "get_topics":
-        return [];
+        return [
+          { name: "demo-events", partitions: 3, messages: 142 },
+          { name: "user-signups", partitions: 1, messages: 38 },
+          { name: "orders", partitions: 6, messages: 1024 },
+        ];
       case "get_server_info":
         return { version: "0.2.0 (preview)", uptime_secs: 0, kafka_port: 9092, http_port: 9094 };
       case "list_consumer_groups":
-        return [];
+        return [
+          { group_id: "analytics-pipeline", state: "Stable", members: 3, topics: ["demo-events"] },
+          { group_id: "order-processor", state: "Stable", members: 1, topics: ["orders"] },
+        ];
       case "list_schemas":
-        return [];
+        return [
+          { subject: "demo-events-value", version: 1, schema_type: "JSON" },
+          { subject: "orders-value", version: 2, schema_type: "AVRO" },
+        ];
       case "load_settings":
         return { kafka_port: 9092, http_port: 9094, data_dir: "./data", log_level: "info" };
+      case "start_server":
+      case "stop_server":
+        return null;
+      case "produce_message":
+        return null;
+      case "consume_messages":
+        return [
+          { key: "user-1", value: '{"action":"click","page":"/home"}', offset: 0 },
+          { key: "user-2", value: '{"action":"signup","email":"alice@example.com"}', offset: 1 },
+          { key: "user-1", value: '{"action":"purchase","item":"widget"}', offset: 2 },
+        ];
+      case "create_topic":
+        return null;
+      case "delete_consumer_group":
+        return null;
+      case "describe_consumer_group":
+        return {
+          group_id: (args?.groupId as string) ?? "unknown",
+          state: "Stable",
+          protocol: "range",
+          members: [
+            { member_id: "member-1", client_id: "client-1", host: "/127.0.0.1", assignments: ["demo-events-0"] },
+          ],
+          offsets: [
+            { topic: "demo-events", partition: 0, current_offset: 142, log_end_offset: 142, lag: 0 },
+          ],
+        };
+      case "get_schema":
+        return {
+          subject: (args?.subject as string) ?? "unknown",
+          version: 1,
+          id: 1,
+          schema_type: "JSON",
+          schema: '{"type":"object","properties":{"action":{"type":"string"}}}',
+          compatibility: "BACKWARD",
+        };
+      case "save_settings":
+        return null;
       default:
         console.error(`[Streamline Desktop] Unhandled command in preview mode: "${cmd}"`);
         return null;
