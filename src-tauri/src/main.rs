@@ -24,6 +24,7 @@ struct ServerState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ServerConfig {
+    host: String,
     kafka_port: u16,
     http_port: u16,
     data_dir: String,
@@ -33,6 +34,7 @@ struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            host: "127.0.0.1".into(),
             kafka_port: 9092,
             http_port: 9094,
             data_dir: default_data_dir(),
@@ -272,7 +274,7 @@ struct TopicInfo {
 #[tauri::command]
 async fn get_topics(state: State<'_, ServerState>) -> Result<Vec<TopicInfo>, String> {
     let config = state.config.lock().unwrap().clone();
-    let url = format!("http://127.0.0.1:{}/api/topics", config.http_port);
+    let url = format!("{}/api/topics", http_base_url(&config));
     let body = reqwest_get(&url).await?;
     serde_json::from_str::<Vec<TopicInfo>>(&body).map_err(|e| e.to_string())
 }
@@ -288,9 +290,14 @@ struct ServerInfo {
 #[tauri::command]
 async fn get_server_info(state: State<'_, ServerState>) -> Result<ServerInfo, String> {
     let config = state.config.lock().unwrap().clone();
-    let url = format!("http://127.0.0.1:{}/api/info", config.http_port);
+    let url = format!("{}/api/info", http_base_url(&config));
     let body = reqwest_get(&url).await?;
     serde_json::from_str::<ServerInfo>(&body).map_err(|e| e.to_string())
+}
+
+/// Build the HTTP base URL from config.
+fn http_base_url(config: &ServerConfig) -> String {
+    format!("http://{}:{}", config.host, config.http_port)
 }
 
 /// HTTP GET using reqwest client.
@@ -360,7 +367,7 @@ async fn produce_message(
     value: String,
 ) -> Result<(), String> {
     let config = state.config.lock().unwrap().clone();
-    let url = format!("http://127.0.0.1:{}/api/topics/{}/messages", config.http_port, topic);
+    let url = format!("{}/api/topics/{}/messages", http_base_url(&config), topic);
     let body = serde_json::to_string(&ProduceRequest { key, value })
         .map_err(|e| e.to_string())?;
     reqwest_post(&url, &body).await?;
@@ -383,8 +390,8 @@ async fn consume_messages(
     let config = state.config.lock().unwrap().clone();
     let limit = limit.unwrap_or(50);
     let url = format!(
-        "http://127.0.0.1:{}/api/topics/{}/messages?limit={}",
-        config.http_port, topic, limit
+        "{}/api/topics/{}/messages?limit={}",
+        http_base_url(&config), topic, limit
     );
     let body = reqwest_get(&url).await?;
     serde_json::from_str::<Vec<ConsumedMessage>>(&body).map_err(|e| e.to_string())
@@ -397,7 +404,7 @@ async fn create_topic(
     partitions: Option<u32>,
 ) -> Result<(), String> {
     let config = state.config.lock().unwrap().clone();
-    let url = format!("http://127.0.0.1:{}/api/topics", config.http_port);
+    let url = format!("{}/api/topics", http_base_url(&config));
     let body = serde_json::json!({
         "name": name,
         "partitions": partitions.unwrap_or(1),
@@ -413,7 +420,7 @@ async fn delete_topic(
     name: String,
 ) -> Result<(), String> {
     let config = state.config.lock().unwrap().clone();
-    let url = format!("http://127.0.0.1:{}/api/topics/{}", config.http_port, name);
+    let url = format!("{}/api/topics/{}", http_base_url(&config), name);
     reqwest_delete(&url).await?;
     Ok(())
 }
@@ -425,7 +432,7 @@ async fn delete_topic(
 #[tauri::command]
 async fn list_consumer_groups(state: State<'_, ServerState>) -> Result<Vec<ConsumerGroupInfo>, String> {
     let config = state.config.lock().unwrap().clone();
-    let url = format!("http://127.0.0.1:{}/api/consumer-groups", config.http_port);
+    let url = format!("{}/api/consumer-groups", http_base_url(&config));
     let body = reqwest_get(&url).await?;
     serde_json::from_str::<Vec<ConsumerGroupInfo>>(&body).map_err(|e| e.to_string())
 }
@@ -437,8 +444,8 @@ async fn describe_consumer_group(
 ) -> Result<ConsumerGroupDetail, String> {
     let config = state.config.lock().unwrap().clone();
     let url = format!(
-        "http://127.0.0.1:{}/api/consumer-groups/{}",
-        config.http_port, group_id
+        "{}/api/consumer-groups/{}",
+        http_base_url(&config), group_id
     );
     let body = reqwest_get(&url).await?;
     serde_json::from_str::<ConsumerGroupDetail>(&body).map_err(|e| e.to_string())
@@ -451,8 +458,8 @@ async fn delete_consumer_group(
 ) -> Result<(), String> {
     let config = state.config.lock().unwrap().clone();
     let url = format!(
-        "http://127.0.0.1:{}/api/consumer-groups/{}",
-        config.http_port, group_id
+        "{}/api/consumer-groups/{}",
+        http_base_url(&config), group_id
     );
     reqwest_delete(&url).await?;
     Ok(())
@@ -465,7 +472,7 @@ async fn delete_consumer_group(
 #[tauri::command]
 async fn list_schemas(state: State<'_, ServerState>) -> Result<Vec<SchemaSubject>, String> {
     let config = state.config.lock().unwrap().clone();
-    let url = format!("http://127.0.0.1:{}/api/schemas/subjects", config.http_port);
+    let url = format!("{}/api/schemas/subjects", http_base_url(&config));
     let body = reqwest_get(&url).await?;
     // The API may return just subject names as strings or full objects
     if let Ok(subjects) = serde_json::from_str::<Vec<String>>(&body) {
@@ -489,8 +496,8 @@ async fn get_schema(
 ) -> Result<SchemaDetail, String> {
     let config = state.config.lock().unwrap().clone();
     let url = format!(
-        "http://127.0.0.1:{}/api/schemas/subjects/{}/versions/latest",
-        config.http_port, subject
+        "{}/api/schemas/subjects/{}/versions/latest",
+        http_base_url(&config), subject
     );
     let body = reqwest_get(&url).await?;
     serde_json::from_str::<SchemaDetail>(&body).map_err(|e| e.to_string())
@@ -675,7 +682,7 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: ServerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.kafka_port, config.kafka_port);
-        assert_eq!(parsed.http_port, config.http_port);
+        assert_eq!(parsed.http_port, http_base_url(&config));
         assert_eq!(parsed.log_level, config.log_level);
     }
 
