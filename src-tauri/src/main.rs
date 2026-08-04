@@ -464,8 +464,8 @@ fn stop_server(state: State<'_, ServerState>) -> Result<(), String> {
 #[tauri::command]
 async fn get_topics(state: State<'_, ServerState>) -> Result<Vec<TopicInfo>, String> {
     let config = running_config(&state)?;
-    let url = format!("{}/api/v1/topics", http_base_url(&config));
-    let body = reqwest_get(&url).await?;
+    let paths = TopicApiPaths::new(http_base_url(&config));
+    let body = reqwest_get(&paths.topics()).await?;
     Ok(user_topics(parse_topics(&body)?))
 }
 
@@ -581,11 +581,7 @@ async fn produce_message(
 ) -> Result<(), String> {
     validate_user_topic(&topic)?;
     let config = running_config(&state)?;
-    let url = format!(
-        "{}/api/v1/topics/{}/messages",
-        http_base_url(&config),
-        encode_path_segment(&topic)
-    );
+    let url = TopicApiPaths::new(http_base_url(&config)).messages(&topic);
     let body =
         serde_json::to_string(&build_produce_request(key, value)).map_err(|e| e.to_string())?;
     reqwest_post(&url, &body).await?;
@@ -601,8 +597,8 @@ async fn consume_messages(
     validate_user_topic(&topic)?;
     let config = running_config(&state)?;
     let limit = limit.unwrap_or(50) as usize;
-    let topics_url = format!("{}/api/v1/topics", http_base_url(&config));
-    let topics = parse_topics(&reqwest_get(&topics_url).await?)?;
+    let paths = TopicApiPaths::new(http_base_url(&config));
+    let topics = parse_topics(&reqwest_get(&paths.topics()).await?)?;
     let partition_count = topics
         .iter()
         .find(|entry| entry.name == topic)
@@ -620,16 +616,9 @@ async fn consume_messages(
         rotated_partition_order(partition_count, start)
     };
 
-    let topic = encode_path_segment(&topic);
     let mut partition_messages = Vec::with_capacity(partition_count);
     for partition in partition_order {
-        let url = format!(
-            "{}/api/v1/topics/{}/partitions/{}/messages?offset=0&limit={}",
-            http_base_url(&config),
-            topic,
-            partition,
-            limit
-        );
+        let url = paths.partition_messages(&topic, partition, limit);
         let body = reqwest_get(&url).await?;
         partition_messages.push(parse_consumed_messages(&body)?);
     }
@@ -645,7 +634,7 @@ async fn create_topic(
 ) -> Result<(), String> {
     validate_user_topic(&name)?;
     let config = running_config(&state)?;
-    let url = format!("{}/api/v1/topics", http_base_url(&config));
+    let url = TopicApiPaths::new(http_base_url(&config)).topics();
     let body = serde_json::json!({
         "name": name,
         "partitions": partitions.unwrap_or(1),
@@ -659,11 +648,7 @@ async fn create_topic(
 async fn delete_topic(state: State<'_, ServerState>, name: String) -> Result<(), String> {
     validate_user_topic(&name)?;
     let config = running_config(&state)?;
-    let url = format!(
-        "{}/api/v1/topics/{}",
-        http_base_url(&config),
-        encode_path_segment(&name)
-    );
+    let url = TopicApiPaths::new(http_base_url(&config)).topic(&name);
     reqwest_delete(&url).await?;
     Ok(())
 }

@@ -1,5 +1,42 @@
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+
+pub(crate) struct TopicApiPaths {
+    base_url: String,
+}
+
+impl TopicApiPaths {
+    pub(crate) fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+        }
+    }
+
+    pub(crate) fn topics(&self) -> String {
+        format!("{}/api/v1/topics", self.base_url)
+    }
+
+    pub(crate) fn messages(&self, topic: &str) -> String {
+        format!("{}/{}/messages", self.topics(), encode_segment(topic))
+    }
+
+    pub(crate) fn partition_messages(&self, topic: &str, partition: usize, limit: usize) -> String {
+        format!(
+            "{}/{}/partitions/{partition}/messages?offset=0&limit={limit}",
+            self.topics(),
+            encode_segment(topic)
+        )
+    }
+
+    pub(crate) fn topic(&self, topic: &str) -> String {
+        format!("{}/{}", self.topics(), encode_segment(topic))
+    }
+}
+
+fn encode_segment(segment: &str) -> String {
+    utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string()
+}
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct TopicInfo {
@@ -143,4 +180,23 @@ pub(crate) fn rotated_partition_order(partition_count: usize, start: usize) -> V
     (0..partition_count)
         .map(|offset| (start + offset) % partition_count)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TopicApiPaths;
+
+    #[test]
+    fn topic_paths_preserve_the_core_contract() {
+        let paths = TopicApiPaths::new("http://127.0.0.1:9094/");
+        assert_eq!(paths.topics(), "http://127.0.0.1:9094/api/v1/topics");
+        assert_eq!(
+            paths.messages("orders/eu"),
+            "http://127.0.0.1:9094/api/v1/topics/orders%2Feu/messages"
+        );
+        assert_eq!(
+            paths.partition_messages("orders", 2, 50),
+            "http://127.0.0.1:9094/api/v1/topics/orders/partitions/2/messages?offset=0&limit=50"
+        );
+    }
 }
