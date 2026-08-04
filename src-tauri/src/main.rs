@@ -5,7 +5,7 @@
 
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{
@@ -17,6 +17,10 @@ use tauri::{
     tray::TrayIconBuilder,
     Manager, State,
 };
+
+mod topic_api;
+
+use topic_api::*;
 
 // ---------------------------------------------------------------------------
 // State
@@ -457,43 +461,6 @@ fn stop_server(state: State<'_, ServerState>) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
-struct TopicInfo {
-    name: String,
-    partitions: usize,
-    messages: u64,
-    #[serde(default, skip_serializing)]
-    internal: bool,
-}
-
-#[derive(Deserialize)]
-struct TopicInfoResponse {
-    name: String,
-    partition_count: usize,
-    total_messages: u64,
-    is_internal: bool,
-}
-
-fn parse_topics(body: &str) -> Result<Vec<TopicInfo>, String> {
-    let topics = serde_json::from_str::<Vec<TopicInfoResponse>>(body).map_err(|e| e.to_string())?;
-    Ok(topics
-        .into_iter()
-        .map(|topic| TopicInfo {
-            name: topic.name,
-            partitions: topic.partition_count,
-            messages: topic.total_messages,
-            internal: topic.is_internal,
-        })
-        .collect())
-}
-
-fn user_topics(topics: Vec<TopicInfo>) -> Vec<TopicInfo> {
-    topics
-        .into_iter()
-        .filter(|topic| !topic.internal && validate_user_topic(&topic.name).is_ok())
-        .collect()
-}
-
 #[tauri::command]
 async fn get_topics(state: State<'_, ServerState>) -> Result<Vec<TopicInfo>, String> {
     let config = running_config(&state)?;
@@ -541,15 +508,6 @@ fn http_base_url(config: &ServerConfig) -> String {
 
 fn encode_path_segment(segment: &str) -> String {
     utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string()
-}
-
-fn validate_user_topic(topic: &str) -> Result<(), String> {
-    if topic == "_schemas" || topic.starts_with("__") {
-        return Err(format!(
-            "Topic '{topic}' is reserved for Streamline internals"
-        ));
-    }
-    Ok(())
 }
 
 /// HTTP GET using reqwest client.
@@ -614,31 +572,6 @@ async fn reqwest_delete(url: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to read response body: {e}"))
 }
 
-#[derive(Serialize, Deserialize)]
-struct ProduceRequest {
-    records: Vec<ProduceRecord>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ProduceRecord {
-    key: Option<String>,
-    value: serde_json::Value,
-    partition: Option<i32>,
-    headers: std::collections::HashMap<String, String>,
-}
-
-fn build_produce_request(key: Option<String>, value: String) -> ProduceRequest {
-    let value = serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
-    ProduceRequest {
-        records: vec![ProduceRecord {
-            key,
-            value,
-            partition: None,
-            headers: std::collections::HashMap::new(),
-        }],
-    }
-}
-
 #[tauri::command]
 async fn produce_message(
     state: State<'_, ServerState>,
@@ -657,79 +590,6 @@ async fn produce_message(
         serde_json::to_string(&build_produce_request(key, value)).map_err(|e| e.to_string())?;
     reqwest_post(&url, &body).await?;
     Ok(())
-}
-
-#[derive(Serialize, Deserialize)]
-struct ConsumedMessage {
-    key: String,
-    value: String,
-    partition: i32,
-    offset: i64,
-}
-
-#[derive(Deserialize)]
-struct ConsumeResponse {
-    partition: i32,
-    records: Vec<ConsumeRecord>,
-}
-
-#[derive(Deserialize)]
-struct ConsumeRecord {
-    key: Option<String>,
-    value: serde_json::Value,
-    offset: i64,
-}
-
-fn parse_consumed_messages(body: &str) -> Result<Vec<ConsumedMessage>, String> {
-    let response = serde_json::from_str::<ConsumeResponse>(body).map_err(|e| e.to_string())?;
-    let partition = response.partition;
-    response
-        .records
-        .into_iter()
-        .map(|record| {
-            let value = match record.value {
-                serde_json::Value::String(value) => value,
-                value => serde_json::to_string(&value).map_err(|e| e.to_string())?,
-            };
-            Ok(ConsumedMessage {
-                key: record.key.unwrap_or_default(),
-                value,
-                partition,
-                offset: record.offset,
-            })
-        })
-        .collect()
-}
-
-fn merge_partition_messages(
-    partitions: Vec<Vec<ConsumedMessage>>,
-    limit: usize,
-) -> Vec<ConsumedMessage> {
-    let mut partitions: Vec<VecDeque<ConsumedMessage>> =
-        partitions.into_iter().map(VecDeque::from).collect();
-    let mut messages = Vec::with_capacity(limit);
-    while messages.len() < limit {
-        let mut found_message = false;
-        for partition in &mut partitions {
-            if let Some(message) = partition.pop_front() {
-                messages.push(message);
-                found_message = true;
-                if messages.len() == limit {
-                    break;
-                }
-            }
-        }
-        if !found_message {
-            break;
-        }
-    }
-    messages
-}
-
-fn rotated_partition_order(partition_count: usize, start: usize) -> Vec<usize> {
-    (0..partition_count)
-        .map(|offset| (start + offset) % partition_count)
-        .collect()
 }
 
 #[tauri::command]
