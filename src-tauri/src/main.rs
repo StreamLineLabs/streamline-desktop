@@ -3,10 +3,15 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Mutex,
+};
 use tauri::{
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
@@ -18,12 +23,28 @@ use tauri::{
 // ---------------------------------------------------------------------------
 
 struct ServerState {
-    process: Mutex<Option<Child>>,
+    process: Mutex<ServerProcess>,
     config: Mutex<ServerConfig>,
+    consume_cursor: Mutex<HashMap<String, usize>>,
+    startup_sequence: AtomicU64,
+}
+
+enum ServerProcess {
+    Stopped,
+    Starting {
+        id: u64,
+        child: Option<Child>,
+        config: ServerConfig,
+    },
+    Running {
+        child: Child,
+        config: ServerConfig,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ServerConfig {
+    #[serde(default = "default_host")]
     host: String,
     kafka_port: u16,
     http_port: u16,
@@ -34,13 +55,17 @@ struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".into(),
+            host: default_host(),
             kafka_port: 9092,
             http_port: 9094,
             data_dir: default_data_dir(),
             log_level: "info".into(),
         }
     }
+}
+
+fn default_host() -> String {
+    "127.0.0.1".into()
 }
 
 fn default_data_dir() -> String {
@@ -63,7 +88,11 @@ fn dirs_next_data_dir() -> Option<PathBuf> {
         std::env::var("XDG_DATA_HOME")
             .ok()
             .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".local/share")))
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".local/share"))
+            })
             .map(|p| p.join("streamline-desktop"))
     }
     #[cfg(target_os = "windows")]
@@ -82,75 +111,210 @@ fn dirs_next_data_dir() -> Option<PathBuf> {
 // Server lifecycle helpers
 // ---------------------------------------------------------------------------
 
+fn streamline_binary_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "streamline.exe"
+    } else {
+        "streamline"
+    }
+}
+
 fn streamline_binary_path() -> PathBuf {
     // 1. Check STREAMLINE_BINARY env var (explicit override)
     if let Ok(env_path) = std::env::var("STREAMLINE_BINARY") {
-        let p = PathBuf::from(env_path);
-        if p.exists() {
-            return p;
-        }
+        return PathBuf::from(env_path);
     }
 
-    // 2. Check bundled location (Tauri resource bundle)
+    // 2. Tauri external binaries are installed beside the application binary.
     let mut path = std::env::current_exe().unwrap_or_default();
     path.pop(); // remove binary name
-    #[cfg(target_os = "macos")]
-    {
-        // Inside .app bundle: Contents/MacOS/../Resources/streamline
-        path.pop();
-        path.push("Resources");
-    }
-    path.push("streamline");
+    path.push(streamline_binary_name());
     if path.exists() {
         return path;
     }
 
-    // 3. Fall back to PATH lookup
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("streamline")
-        .output()
-    {
-        if output.status.success() {
-            let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !found.is_empty() {
-                return PathBuf::from(found);
-            }
-        }
-    }
-
-    // Return the bundled path (will produce a clear error in spawn_server)
-    path
+    // 3. Let Command resolve the executable from PATH on every platform.
+    PathBuf::from(streamline_binary_name())
 }
 
-fn spawn_server(config: &ServerConfig) -> Result<Child, String> {
+fn server_arguments(config: &ServerConfig) -> Vec<String> {
+    vec![
+        "--listen-addr".into(),
+        format!("{}:{}", config.host, config.kafka_port),
+        "--http-addr".into(),
+        format!("{}:{}", config.host, config.http_port),
+        "--data-dir".into(),
+        config.data_dir.clone(),
+        "--log-level".into(),
+        config.log_level.clone(),
+    ]
+}
+
+fn readiness_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .map_err(|e| format!("Failed to create readiness client: {e}"))
+}
+
+async fn server_is_ready(client: &reqwest::Client, readiness_url: &str) -> bool {
+    client
+        .get(readiness_url)
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
+}
+
+async fn wait_for_server(
+    state: &ServerState,
+    startup_id: u64,
+    client: &reqwest::Client,
+    config: &ServerConfig,
+) -> Result<u32, String> {
+    let readiness_url = format!("{}/health/ready", http_base_url(config));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+
+    loop {
+        {
+            let mut process = state.process.lock().unwrap();
+            let child = match &mut *process {
+                ServerProcess::Starting {
+                    id,
+                    child: Some(child),
+                    ..
+                } if *id == startup_id => child,
+                _ => return Err("Server startup was cancelled".into()),
+            };
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| format!("Failed to inspect Streamline process: {e}"))?
+            {
+                *process = ServerProcess::Stopped;
+                return Err(format!(
+                    "Streamline exited during startup with status {status}"
+                ));
+            }
+        }
+
+        if server_is_ready(client, &readiness_url).await {
+            let mut process = state.process.lock().unwrap();
+            let starting = std::mem::replace(&mut *process, ServerProcess::Stopped);
+            match starting {
+                ServerProcess::Starting {
+                    id,
+                    child: Some(mut child),
+                    config,
+                } if id == startup_id => {
+                    if let Some(status) = child
+                        .try_wait()
+                        .map_err(|e| format!("Failed to inspect Streamline process: {e}"))?
+                    {
+                        return Err(format!(
+                            "Streamline exited during startup with status {status}"
+                        ));
+                    }
+                    let pid = child.id();
+                    *process = ServerProcess::Running { child, config };
+                    return Ok(pid);
+                }
+                other => {
+                    *process = other;
+                    return Err("Server startup was cancelled".into());
+                }
+            }
+        }
+
+        if std::time::Instant::now() >= deadline {
+            cancel_startup(state, startup_id, ());
+            return Err(format!(
+                "Streamline did not become ready at {readiness_url} within 15 seconds"
+            ));
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+fn spawn_server_process(config: &ServerConfig) -> Result<Child, String> {
     let bin = streamline_binary_path();
-    if !bin.exists() {
+    if bin.components().count() > 1 && !bin.exists() {
         return Err(format!("Streamline binary not found at {}", bin.display()));
     }
 
     std::fs::create_dir_all(&config.data_dir).map_err(|e| e.to_string())?;
 
     Command::new(&bin)
-        .args([
-            "--kafka-port",
-            &config.kafka_port.to_string(),
-            "--http-port",
-            &config.http_port.to_string(),
-            "--data-dir",
-            &config.data_dir,
-            "--log-level",
-            &config.log_level,
-        ])
+        .args(server_arguments(config))
         .spawn()
         .map_err(|e| format!("Failed to start Streamline: {e}"))
 }
 
-fn kill_server(process: &mut Option<Child>) {
-    if let Some(ref mut child) = process {
-        let _ = child.kill();
-        let _ = child.wait();
+fn kill_server(process: &mut ServerProcess) {
+    match process {
+        ServerProcess::Starting {
+            child: Some(child), ..
+        }
+        | ServerProcess::Running { child, .. } => {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        ServerProcess::Stopped | ServerProcess::Starting { child: None, .. } => {}
     }
-    *process = None;
+    *process = ServerProcess::Stopped;
+}
+
+fn process_status(process: &mut ServerProcess) -> (bool, Option<u32>, Option<ServerConfig>) {
+    match process {
+        ServerProcess::Stopped => (false, None, None),
+        ServerProcess::Starting { config, .. } => (false, None, Some(config.clone())),
+        ServerProcess::Running { child, config } => match child.try_wait() {
+            Ok(None) => (true, Some(child.id()), Some(config.clone())),
+            Ok(Some(_)) | Err(_) => {
+                *process = ServerProcess::Stopped;
+                (false, None, None)
+            }
+        },
+    }
+}
+
+fn running_config(state: &ServerState) -> Result<ServerConfig, String> {
+    match &*state.process.lock().unwrap() {
+        ServerProcess::Running { config, .. } => Ok(config.clone()),
+        ServerProcess::Starting { .. } => Err("Server is still starting".into()),
+        ServerProcess::Stopped => Err("Server is not running".into()),
+    }
+}
+
+fn cancel_startup<T>(state: &ServerState, startup_id: u64, error: T) -> T {
+    let mut process = state.process.lock().unwrap();
+    if matches!(&*process, ServerProcess::Starting { id, .. } if *id == startup_id) {
+        kill_server(&mut process);
+    }
+    error
+}
+
+fn install_starting_child(
+    state: &ServerState,
+    startup_id: u64,
+    child: Child,
+) -> Result<(), String> {
+    let mut process = state.process.lock().unwrap();
+    if let ServerProcess::Starting {
+        id,
+        child: child_slot,
+        ..
+    } = &mut *process
+    {
+        if *id == startup_id && child_slot.is_none() {
+            *child_slot = Some(child);
+            return Ok(());
+        }
+    }
+
+    let mut child = child;
+    let _ = child.kill();
+    let _ = child.wait();
+    Err("Server startup was cancelled".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +334,7 @@ struct ServerStatus {
 struct ConsumerGroupInfo {
     group_id: String,
     state: String,
-    members: u32,
+    members: usize,
     #[serde(default)]
     topics: Vec<String>,
 }
@@ -217,8 +381,8 @@ struct SchemaSubject {
 #[derive(Serialize, Deserialize)]
 struct SchemaDetail {
     subject: String,
-    version: u32,
-    id: u32,
+    version: i32,
+    id: i32,
     schema_type: String,
     schema: String,
     #[serde(default)]
@@ -227,77 +391,165 @@ struct SchemaDetail {
 
 #[tauri::command]
 fn get_server_status(state: State<'_, ServerState>) -> ServerStatus {
-    let proc = state.process.lock().unwrap();
-    let config = state.config.lock().unwrap();
+    let mut process = state.process.lock().unwrap();
+    let (running, pid, active_config) = process_status(&mut process);
+    drop(process);
+    let config = active_config.unwrap_or_else(|| state.config.lock().unwrap().clone());
     ServerStatus {
-        running: proc.is_some(),
-        pid: proc.as_ref().map(|c| c.id()),
+        running,
+        pid,
         kafka_port: config.kafka_port,
         http_port: config.http_port,
     }
 }
 
 #[tauri::command]
-fn start_server(state: State<'_, ServerState>) -> Result<ServerStatus, String> {
-    let mut proc = state.process.lock().unwrap();
-    if proc.is_some() {
-        return Err("Server is already running".into());
-    }
+async fn start_server(state: State<'_, ServerState>) -> Result<ServerStatus, String> {
     let config = state.config.lock().unwrap().clone();
-    let child = spawn_server(&config)?;
+    let startup_id = state.startup_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+    {
+        let mut process = state.process.lock().unwrap();
+        match &*process {
+            ServerProcess::Stopped => {
+                *process = ServerProcess::Starting {
+                    id: startup_id,
+                    child: None,
+                    config: config.clone(),
+                };
+            }
+            ServerProcess::Starting { .. } => return Err("Server is already starting".into()),
+            ServerProcess::Running { .. } => return Err("Server is already running".into()),
+        }
+    }
+
+    let client = readiness_client().map_err(|error| cancel_startup(&state, startup_id, error))?;
+    let readiness_url = format!("{}/health/ready", http_base_url(&config));
+    if server_is_ready(&client, &readiness_url).await {
+        return Err(cancel_startup(
+            &state,
+            startup_id,
+            format!("A Streamline server is already responding at {readiness_url}"),
+        ));
+    }
+
+    let child =
+        spawn_server_process(&config).map_err(|error| cancel_startup(&state, startup_id, error))?;
+    install_starting_child(&state, startup_id, child)?;
+    let pid = wait_for_server(&state, startup_id, &client, &config).await?;
+
     let status = ServerStatus {
         running: true,
-        pid: Some(child.id()),
+        pid: Some(pid),
         kafka_port: config.kafka_port,
         http_port: config.http_port,
     };
-    *proc = Some(child);
     Ok(status)
 }
 
 #[tauri::command]
 fn stop_server(state: State<'_, ServerState>) -> Result<(), String> {
-    let mut proc = state.process.lock().unwrap();
-    if proc.is_none() {
-        return Err("Server is not running".into());
+    let mut process = state.process.lock().unwrap();
+    match &*process {
+        ServerProcess::Stopped => return Err("Server is not running".into()),
+        ServerProcess::Starting { .. } | ServerProcess::Running { .. } => {}
     }
-    kill_server(&mut proc);
+    kill_server(&mut process);
     Ok(())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct TopicInfo {
     name: String,
-    partitions: u32,
+    partitions: usize,
+    messages: u64,
+    #[serde(default, skip_serializing)]
+    internal: bool,
+}
+
+#[derive(Deserialize)]
+struct TopicInfoResponse {
+    name: String,
+    partition_count: usize,
+    total_messages: u64,
+    is_internal: bool,
+}
+
+fn parse_topics(body: &str) -> Result<Vec<TopicInfo>, String> {
+    let topics = serde_json::from_str::<Vec<TopicInfoResponse>>(body).map_err(|e| e.to_string())?;
+    Ok(topics
+        .into_iter()
+        .map(|topic| TopicInfo {
+            name: topic.name,
+            partitions: topic.partition_count,
+            messages: topic.total_messages,
+            internal: topic.is_internal,
+        })
+        .collect())
+}
+
+fn user_topics(topics: Vec<TopicInfo>) -> Vec<TopicInfo> {
+    topics
+        .into_iter()
+        .filter(|topic| !topic.internal && validate_user_topic(&topic.name).is_ok())
+        .collect()
 }
 
 #[tauri::command]
 async fn get_topics(state: State<'_, ServerState>) -> Result<Vec<TopicInfo>, String> {
-    let config = state.config.lock().unwrap().clone();
-    let url = format!("{}/api/topics", http_base_url(&config));
+    let config = running_config(&state)?;
+    let url = format!("{}/api/v1/topics", http_base_url(&config));
     let body = reqwest_get(&url).await?;
-    serde_json::from_str::<Vec<TopicInfo>>(&body).map_err(|e| e.to_string())
+    Ok(user_topics(parse_topics(&body)?))
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct ServerInfo {
     version: String,
-    uptime_secs: u64,
+    uptime_secs: f64,
     kafka_port: u16,
     http_port: u16,
 }
 
+#[derive(Deserialize)]
+struct ServerInfoResponse {
+    version: String,
+    uptime_seconds: f64,
+}
+
+fn parse_server_info(body: &str, config: &ServerConfig) -> Result<ServerInfo, String> {
+    let info = serde_json::from_str::<ServerInfoResponse>(body).map_err(|e| e.to_string())?;
+    Ok(ServerInfo {
+        version: info.version,
+        uptime_secs: info.uptime_seconds,
+        kafka_port: config.kafka_port,
+        http_port: config.http_port,
+    })
+}
+
 #[tauri::command]
 async fn get_server_info(state: State<'_, ServerState>) -> Result<ServerInfo, String> {
-    let config = state.config.lock().unwrap().clone();
-    let url = format!("{}/api/info", http_base_url(&config));
+    let config = running_config(&state)?;
+    let url = format!("{}/info", http_base_url(&config));
     let body = reqwest_get(&url).await?;
-    serde_json::from_str::<ServerInfo>(&body).map_err(|e| e.to_string())
+    parse_server_info(&body, &config)
 }
 
 /// Build the HTTP base URL from config.
 fn http_base_url(config: &ServerConfig) -> String {
     format!("http://{}:{}", config.host, config.http_port)
+}
+
+fn encode_path_segment(segment: &str) -> String {
+    utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string()
+}
+
+fn validate_user_topic(topic: &str) -> Result<(), String> {
+    if topic == "_schemas" || topic.starts_with("__") {
+        return Err(format!(
+            "Topic '{topic}' is reserved for Streamline internals"
+        ));
+    }
+    Ok(())
 }
 
 /// HTTP GET using reqwest client.
@@ -312,7 +564,10 @@ async fn reqwest_get(url: &str) -> Result<String, String> {
         return Err(format!("HTTP {status} from {url}: {body}"));
     }
 
-    response.text().await.map_err(|e| format!("Failed to read response body: {e}"))
+    response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response body: {e}"))
 }
 
 /// HTTP POST helper using reqwest client.
@@ -332,7 +587,10 @@ async fn reqwest_post(url: &str, body: &str) -> Result<String, String> {
         return Err(format!("HTTP POST {status}: {err_body}"));
     }
 
-    response.text().await.map_err(|e| format!("Failed to read response body: {e}"))
+    response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response body: {e}"))
 }
 
 /// HTTP DELETE helper using reqwest client.
@@ -350,13 +608,35 @@ async fn reqwest_delete(url: &str) -> Result<String, String> {
         return Err(format!("HTTP DELETE {status}: {err_body}"));
     }
 
-    response.text().await.map_err(|e| format!("Failed to read response body: {e}"))
+    response
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read response body: {e}"))
 }
 
 #[derive(Serialize, Deserialize)]
 struct ProduceRequest {
+    records: Vec<ProduceRecord>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProduceRecord {
     key: Option<String>,
-    value: String,
+    value: serde_json::Value,
+    partition: Option<i32>,
+    headers: std::collections::HashMap<String, String>,
+}
+
+fn build_produce_request(key: Option<String>, value: String) -> ProduceRequest {
+    let value = serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
+    ProduceRequest {
+        records: vec![ProduceRecord {
+            key,
+            value,
+            partition: None,
+            headers: std::collections::HashMap::new(),
+        }],
+    }
 }
 
 #[tauri::command]
@@ -366,10 +646,15 @@ async fn produce_message(
     key: Option<String>,
     value: String,
 ) -> Result<(), String> {
-    let config = state.config.lock().unwrap().clone();
-    let url = format!("{}/api/topics/{}/messages", http_base_url(&config), topic);
-    let body = serde_json::to_string(&ProduceRequest { key, value })
-        .map_err(|e| e.to_string())?;
+    validate_user_topic(&topic)?;
+    let config = running_config(&state)?;
+    let url = format!(
+        "{}/api/v1/topics/{}/messages",
+        http_base_url(&config),
+        encode_path_segment(&topic)
+    );
+    let body =
+        serde_json::to_string(&build_produce_request(key, value)).map_err(|e| e.to_string())?;
     reqwest_post(&url, &body).await?;
     Ok(())
 }
@@ -378,7 +663,73 @@ async fn produce_message(
 struct ConsumedMessage {
     key: String,
     value: String,
-    offset: u64,
+    partition: i32,
+    offset: i64,
+}
+
+#[derive(Deserialize)]
+struct ConsumeResponse {
+    partition: i32,
+    records: Vec<ConsumeRecord>,
+}
+
+#[derive(Deserialize)]
+struct ConsumeRecord {
+    key: Option<String>,
+    value: serde_json::Value,
+    offset: i64,
+}
+
+fn parse_consumed_messages(body: &str) -> Result<Vec<ConsumedMessage>, String> {
+    let response = serde_json::from_str::<ConsumeResponse>(body).map_err(|e| e.to_string())?;
+    let partition = response.partition;
+    response
+        .records
+        .into_iter()
+        .map(|record| {
+            let value = match record.value {
+                serde_json::Value::String(value) => value,
+                value => serde_json::to_string(&value).map_err(|e| e.to_string())?,
+            };
+            Ok(ConsumedMessage {
+                key: record.key.unwrap_or_default(),
+                value,
+                partition,
+                offset: record.offset,
+            })
+        })
+        .collect()
+}
+
+fn merge_partition_messages(
+    partitions: Vec<Vec<ConsumedMessage>>,
+    limit: usize,
+) -> Vec<ConsumedMessage> {
+    let mut partitions: Vec<VecDeque<ConsumedMessage>> =
+        partitions.into_iter().map(VecDeque::from).collect();
+    let mut messages = Vec::with_capacity(limit);
+    while messages.len() < limit {
+        let mut found_message = false;
+        for partition in &mut partitions {
+            if let Some(message) = partition.pop_front() {
+                messages.push(message);
+                found_message = true;
+                if messages.len() == limit {
+                    break;
+                }
+            }
+        }
+        if !found_message {
+            break;
+        }
+    }
+    messages
+}
+
+fn rotated_partition_order(partition_count: usize, start: usize) -> Vec<usize> {
+    (0..partition_count)
+        .map(|offset| (start + offset) % partition_count)
+        .collect()
 }
 
 #[tauri::command]
@@ -387,14 +738,43 @@ async fn consume_messages(
     topic: String,
     limit: Option<u32>,
 ) -> Result<Vec<ConsumedMessage>, String> {
-    let config = state.config.lock().unwrap().clone();
-    let limit = limit.unwrap_or(50);
-    let url = format!(
-        "{}/api/topics/{}/messages?limit={}",
-        http_base_url(&config), topic, limit
-    );
-    let body = reqwest_get(&url).await?;
-    serde_json::from_str::<Vec<ConsumedMessage>>(&body).map_err(|e| e.to_string())
+    validate_user_topic(&topic)?;
+    let config = running_config(&state)?;
+    let limit = limit.unwrap_or(50) as usize;
+    let topics_url = format!("{}/api/v1/topics", http_base_url(&config));
+    let topics = parse_topics(&reqwest_get(&topics_url).await?)?;
+    let partition_count = topics
+        .iter()
+        .find(|entry| entry.name == topic)
+        .map(|entry| entry.partitions)
+        .ok_or_else(|| format!("Topic '{topic}' was not found"))?;
+    if partition_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let partition_order = {
+        let mut cursors = state.consume_cursor.lock().unwrap();
+        let cursor = cursors.entry(topic.clone()).or_default();
+        let start = *cursor % partition_count;
+        *cursor = (start + limit.max(1).min(partition_count)) % partition_count;
+        rotated_partition_order(partition_count, start)
+    };
+
+    let topic = encode_path_segment(&topic);
+    let mut partition_messages = Vec::with_capacity(partition_count);
+    for partition in partition_order {
+        let url = format!(
+            "{}/api/v1/topics/{}/partitions/{}/messages?offset=0&limit={}",
+            http_base_url(&config),
+            topic,
+            partition,
+            limit
+        );
+        let body = reqwest_get(&url).await?;
+        partition_messages.push(parse_consumed_messages(&body)?);
+    }
+
+    Ok(merge_partition_messages(partition_messages, limit))
 }
 
 #[tauri::command]
@@ -403,8 +783,9 @@ async fn create_topic(
     name: String,
     partitions: Option<u32>,
 ) -> Result<(), String> {
-    let config = state.config.lock().unwrap().clone();
-    let url = format!("{}/api/topics", http_base_url(&config));
+    validate_user_topic(&name)?;
+    let config = running_config(&state)?;
+    let url = format!("{}/api/v1/topics", http_base_url(&config));
     let body = serde_json::json!({
         "name": name,
         "partitions": partitions.unwrap_or(1),
@@ -415,12 +796,14 @@ async fn create_topic(
 }
 
 #[tauri::command]
-async fn delete_topic(
-    state: State<'_, ServerState>,
-    name: String,
-) -> Result<(), String> {
-    let config = state.config.lock().unwrap().clone();
-    let url = format!("{}/api/topics/{}", http_base_url(&config), name);
+async fn delete_topic(state: State<'_, ServerState>, name: String) -> Result<(), String> {
+    validate_user_topic(&name)?;
+    let config = running_config(&state)?;
+    let url = format!(
+        "{}/api/v1/topics/{}",
+        http_base_url(&config),
+        encode_path_segment(&name)
+    );
     reqwest_delete(&url).await?;
     Ok(())
 }
@@ -429,12 +812,124 @@ async fn delete_topic(
 // Consumer group commands
 // ---------------------------------------------------------------------------
 
+#[derive(Deserialize)]
+struct ConsumerGroupInfoResponse {
+    group_id: String,
+    state: String,
+    member_count: usize,
+}
+
+#[derive(Deserialize)]
+struct ConsumerGroupDetailResponse {
+    group_id: String,
+    state: String,
+    protocol: String,
+    members: Vec<GroupMemberResponse>,
+}
+
+#[derive(Deserialize)]
+struct GroupMemberResponse {
+    member_id: String,
+    client_id: String,
+    client_host: String,
+    assignments: Vec<MemberAssignmentResponse>,
+}
+
+#[derive(Deserialize)]
+struct MemberAssignmentResponse {
+    topic: String,
+    partitions: Vec<i32>,
+}
+
+#[derive(Deserialize)]
+struct ConsumerGroupLagResponse {
+    partitions: Vec<GroupOffsetResponse>,
+}
+
+#[derive(Deserialize)]
+struct GroupOffsetResponse {
+    topic: String,
+    partition: i32,
+    current_offset: i64,
+    log_end_offset: i64,
+    lag: i64,
+}
+
+fn parse_consumer_groups(body: &str) -> Result<Vec<ConsumerGroupInfo>, String> {
+    let groups =
+        serde_json::from_str::<Vec<ConsumerGroupInfoResponse>>(body).map_err(|e| e.to_string())?;
+    Ok(groups
+        .into_iter()
+        .map(|group| ConsumerGroupInfo {
+            group_id: group.group_id,
+            state: group.state,
+            members: group.member_count,
+            topics: Vec::new(),
+        })
+        .collect())
+}
+
+fn parse_consumer_group_detail(
+    detail_body: &str,
+    lag_body: &str,
+) -> Result<ConsumerGroupDetail, String> {
+    let detail = serde_json::from_str::<ConsumerGroupDetailResponse>(detail_body)
+        .map_err(|e| e.to_string())?;
+    let lag =
+        serde_json::from_str::<ConsumerGroupLagResponse>(lag_body).map_err(|e| e.to_string())?;
+
+    let members = detail
+        .members
+        .into_iter()
+        .map(|member| {
+            let assignments = member
+                .assignments
+                .into_iter()
+                .flat_map(|assignment| {
+                    assignment
+                        .partitions
+                        .into_iter()
+                        .map(move |partition| format!("{}-{}", assignment.topic, partition))
+                })
+                .collect();
+            GroupMember {
+                member_id: member.member_id,
+                client_id: member.client_id,
+                host: member.client_host,
+                assignments,
+            }
+        })
+        .collect();
+
+    let offsets = lag
+        .partitions
+        .into_iter()
+        .map(|offset| GroupOffset {
+            topic: offset.topic,
+            partition: offset.partition,
+            current_offset: offset.current_offset,
+            log_end_offset: offset.log_end_offset,
+            lag: offset.lag,
+        })
+        .collect();
+
+    Ok(ConsumerGroupDetail {
+        group_id: detail.group_id,
+        state: detail.state,
+        protocol: detail.protocol,
+        members,
+        offsets,
+    })
+}
+
 #[tauri::command]
-async fn list_consumer_groups(state: State<'_, ServerState>) -> Result<Vec<ConsumerGroupInfo>, String> {
-    let config = state.config.lock().unwrap().clone();
-    let url = format!("{}/api/consumer-groups", http_base_url(&config));
+async fn list_consumer_groups(
+    state: State<'_, ServerState>,
+) -> Result<Vec<ConsumerGroupInfo>, String> {
+    let config = running_config(&state)?;
+    let url = format!("{}/api/v1/consumer-groups", http_base_url(&config));
     let body = reqwest_get(&url).await?;
-    serde_json::from_str::<Vec<ConsumerGroupInfo>>(&body).map_err(|e| e.to_string())
+    parse_consumer_groups(&body)
 }
 
 #[tauri::command]
@@ -442,13 +937,17 @@ async fn describe_consumer_group(
     state: State<'_, ServerState>,
     group_id: String,
 ) -> Result<ConsumerGroupDetail, String> {
-    let config = state.config.lock().unwrap().clone();
-    let url = format!(
-        "{}/api/consumer-groups/{}",
-        http_base_url(&config), group_id
+    let config = running_config(&state)?;
+    let group_id = encode_path_segment(&group_id);
+    let detail_url = format!(
+        "{}/api/v1/consumer-groups/{}",
+        http_base_url(&config),
+        group_id,
     );
-    let body = reqwest_get(&url).await?;
-    serde_json::from_str::<ConsumerGroupDetail>(&body).map_err(|e| e.to_string())
+    let lag_url = format!("{detail_url}/lag");
+    let detail_body = reqwest_get(&detail_url).await?;
+    let lag_body = reqwest_get(&lag_url).await?;
+    parse_consumer_group_detail(&detail_body, &lag_body)
 }
 
 #[tauri::command]
@@ -456,10 +955,11 @@ async fn delete_consumer_group(
     state: State<'_, ServerState>,
     group_id: String,
 ) -> Result<(), String> {
-    let config = state.config.lock().unwrap().clone();
+    let config = running_config(&state)?;
     let url = format!(
-        "{}/api/consumer-groups/{}",
-        http_base_url(&config), group_id
+        "{}/api/v1/consumer-groups/{}",
+        http_base_url(&config),
+        encode_path_segment(&group_id)
     );
     reqwest_delete(&url).await?;
     Ok(())
@@ -469,24 +969,50 @@ async fn delete_consumer_group(
 // Schema registry commands
 // ---------------------------------------------------------------------------
 
+fn parse_schema_subjects(body: &str) -> Result<Vec<SchemaSubject>, String> {
+    let subjects = serde_json::from_str::<Vec<String>>(body).map_err(|e| e.to_string())?;
+    Ok(subjects
+        .into_iter()
+        .map(|subject| SchemaSubject {
+            subject,
+            version: 0,
+            schema_type: String::new(),
+        })
+        .collect())
+}
+
+#[derive(Deserialize)]
+struct SchemaDetailResponse {
+    subject: String,
+    version: i32,
+    id: i32,
+    #[serde(rename = "schemaType", default = "default_schema_type")]
+    schema_type: String,
+    schema: String,
+}
+
+fn default_schema_type() -> String {
+    "AVRO".into()
+}
+
+fn parse_schema_detail(body: &str) -> Result<SchemaDetail, String> {
+    let detail = serde_json::from_str::<SchemaDetailResponse>(body).map_err(|e| e.to_string())?;
+    Ok(SchemaDetail {
+        subject: detail.subject,
+        version: detail.version,
+        id: detail.id,
+        schema_type: detail.schema_type,
+        schema: detail.schema,
+        compatibility: String::new(),
+    })
+}
+
 #[tauri::command]
 async fn list_schemas(state: State<'_, ServerState>) -> Result<Vec<SchemaSubject>, String> {
-    let config = state.config.lock().unwrap().clone();
-    let url = format!("{}/api/schemas/subjects", http_base_url(&config));
+    let config = running_config(&state)?;
+    let url = format!("{}/subjects", http_base_url(&config));
     let body = reqwest_get(&url).await?;
-    // The API may return just subject names as strings or full objects
-    if let Ok(subjects) = serde_json::from_str::<Vec<String>>(&body) {
-        Ok(subjects
-            .into_iter()
-            .map(|s| SchemaSubject {
-                subject: s,
-                version: 0,
-                schema_type: String::new(),
-            })
-            .collect())
-    } else {
-        serde_json::from_str::<Vec<SchemaSubject>>(&body).map_err(|e| e.to_string())
-    }
+    parse_schema_subjects(&body)
 }
 
 #[tauri::command]
@@ -494,13 +1020,14 @@ async fn get_schema(
     state: State<'_, ServerState>,
     subject: String,
 ) -> Result<SchemaDetail, String> {
-    let config = state.config.lock().unwrap().clone();
+    let config = running_config(&state)?;
     let url = format!(
-        "{}/api/schemas/subjects/{}/versions/latest",
-        http_base_url(&config), subject
+        "{}/subjects/{}/versions/latest",
+        http_base_url(&config),
+        encode_path_segment(&subject)
     );
     let body = reqwest_get(&url).await?;
-    serde_json::from_str::<SchemaDetail>(&body).map_err(|e| e.to_string())
+    parse_schema_detail(&body)
 }
 
 // ---------------------------------------------------------------------------
@@ -544,11 +1071,13 @@ fn main() {
         .unwrap_or_default();
 
     let state = ServerState {
-        process: Mutex::new(None),
+        process: Mutex::new(ServerProcess::Stopped),
         config: Mutex::new(initial_config),
+        consume_cursor: Mutex::new(HashMap::new()),
+        startup_sequence: AtomicU64::new(0),
     };
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(state)
         .setup(|app| {
@@ -568,8 +1097,11 @@ fn main() {
                 .menu(&tray_menu)
                 .on_menu_event(move |app, event| match event.id().as_ref() {
                     "start" => {
-                        let state = app.state::<ServerState>();
-                        let _ = start_server(state);
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let state = app.state::<ServerState>();
+                            let _ = start_server(state).await;
+                        });
                     }
                     "stop" => {
                         let state = app.state::<ServerState>();
@@ -577,8 +1109,8 @@ fn main() {
                     }
                     "quit" => {
                         let state = app.state::<ServerState>();
-                        let mut proc = state.process.lock().unwrap();
-                        kill_server(&mut proc);
+                        let mut process = state.process.lock().unwrap();
+                        kill_server(&mut process);
                         app.exit(0);
                     }
                     _ => {}
@@ -586,10 +1118,13 @@ fn main() {
                 .build(app)?;
 
             // Auto-start the server on launch
-            let state = app.state::<ServerState>();
-            if let Err(e) = start_server(state.clone()) {
-                eprintln!("Auto-start failed (expected during development): {e}");
-            }
+            let app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<ServerState>();
+                if let Err(e) = start_server(state).await {
+                    eprintln!("Auto-start failed (expected during development): {e}");
+                }
+            });
 
             Ok(())
         })
@@ -611,52 +1146,18 @@ fn main() {
             save_settings,
             load_settings,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running Streamline Desktop");
-}
 
-
-/// Application-level error type for Tauri commands.
-#[derive(Debug, thiserror::Error)]
-enum AppError {
-    #[error("Connection failed: {0}")]
-    ConnectionFailed(String),
-    #[error("Operation timed out")]
-    Timeout,
-    #[error("Internal error: {0}")]
-    Internal(String),
-}
-
-impl serde::Serialize for AppError {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-
-/// TLS settings managed through the desktop app UI.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct TlsSettings {
-    enabled: bool,
-    ca_cert_path: Option<String>,
-    client_cert_path: Option<String>,
-    client_key_path: Option<String>,
-    skip_verify: bool,
-}
-
-impl Default for TlsSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            ca_cert_path: None,
-            client_cert_path: None,
-            client_key_path: None,
-            skip_verify: false,
+    app.run(|app, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            let state = app.state::<ServerState>();
+            kill_server(&mut state.process.lock().unwrap());
         }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -682,33 +1183,35 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: ServerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.kafka_port, config.kafka_port);
-        assert_eq!(parsed.http_port, http_base_url(&config));
+        assert_eq!(parsed.http_port, config.http_port);
         assert_eq!(parsed.log_level, config.log_level);
     }
 
     #[test]
-    fn test_tls_settings_default() {
-        let tls = TlsSettings::default();
-        assert!(!tls.enabled);
-        assert!(tls.ca_cert_path.is_none());
-        assert!(tls.client_cert_path.is_none());
-        assert!(tls.client_key_path.is_none());
-        assert!(!tls.skip_verify);
+    fn test_server_config_defaults_missing_host() {
+        let config: ServerConfig = serde_json::from_str(
+            r#"{"kafka_port":9092,"http_port":9094,"data_dir":"./data","log_level":"info"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.host, "127.0.0.1");
     }
 
     #[test]
-    fn test_tls_settings_serialization_roundtrip() {
-        let tls = TlsSettings {
-            enabled: true,
-            ca_cert_path: Some("/path/to/ca.pem".into()),
-            client_cert_path: Some("/path/to/cert.pem".into()),
-            client_key_path: Some("/path/to/key.pem".into()),
-            skip_verify: false,
-        };
-        let json = serde_json::to_string(&tls).unwrap();
-        let parsed: TlsSettings = serde_json::from_str(&json).unwrap();
-        assert!(parsed.enabled);
-        assert_eq!(parsed.ca_cert_path.unwrap(), "/path/to/ca.pem");
+    fn test_server_arguments_use_supported_address_flags() {
+        let arguments = server_arguments(&ServerConfig::default());
+        assert_eq!(
+            arguments,
+            vec![
+                "--listen-addr".to_string(),
+                "127.0.0.1:9092".to_string(),
+                "--http-addr".to_string(),
+                "127.0.0.1:9094".to_string(),
+                "--data-dir".to_string(),
+                default_data_dir(),
+                "--log-level".to_string(),
+                "info".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -745,6 +1248,8 @@ mod tests {
         let topic = TopicInfo {
             name: "events".into(),
             partitions: 3,
+            messages: 0,
+            internal: false,
         };
         let json = serde_json::to_string(&topic).unwrap();
         assert!(json.contains("\"name\":\"events\""));
@@ -752,10 +1257,65 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_topics_uses_streamline_api_fields() {
+        let topics = parse_topics(
+            r#"[{"name":"events","partition_count":3,"replication_factor":1,"is_internal":false,"total_messages":42,"total_bytes":1024}]"#,
+        )
+        .unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].partitions, 3);
+        assert_eq!(topics[0].messages, 42);
+        assert!(!topics[0].internal);
+    }
+
+    #[test]
+    fn test_internal_topics_are_rejected() {
+        assert!(validate_user_topic("_schemas").is_err());
+        assert!(validate_user_topic("__consumer_offsets").is_err());
+        assert!(validate_user_topic("events").is_ok());
+    }
+
+    #[test]
+    fn test_reserved_topics_are_hidden_even_without_internal_flag() {
+        let topics = parse_topics(
+            r#"[{"name":"_schemas","partition_count":1,"replication_factor":1,"is_internal":false,"total_messages":1,"total_bytes":1},{"name":"events","partition_count":1,"replication_factor":1,"is_internal":false,"total_messages":1,"total_bytes":1}]"#,
+        )
+        .unwrap();
+        let visible = user_topics(topics);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].name, "events");
+    }
+
+    #[test]
+    fn test_parse_server_info_maps_wire_contract() {
+        let config = ServerConfig::default();
+        let info = parse_server_info(
+            r#"{"version":"0.3.0","listen_addr":"127.0.0.1:9092","http_addr":"127.0.0.1:9094","data_dir":"./data","topics":2,"uptime_seconds":12.5}"#,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(info.version, "0.3.0");
+        assert_eq!(info.uptime_secs, 12.5);
+        assert_eq!(info.kafka_port, 9092);
+        assert_eq!(info.http_port, 9094);
+    }
+
+    #[test]
+    fn test_build_produce_request_matches_streamline_api() {
+        let request = build_produce_request(Some("key".into()), r#"{"event":"created"}"#.into());
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["records"][0]["key"], "key");
+        assert_eq!(value["records"][0]["value"]["event"], "created");
+        assert!(value["records"][0]["partition"].is_null());
+        assert_eq!(value["records"][0]["headers"], serde_json::json!({}));
+    }
+
+    #[test]
     fn test_consumed_message_serialization() {
         let msg = ConsumedMessage {
             key: "k1".into(),
             value: "hello world".into(),
+            partition: 1,
             offset: 42,
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -766,10 +1326,52 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_consumed_messages_maps_streamline_api() {
+        let messages = parse_consumed_messages(
+            r#"{"topic":"events","partition":0,"records":[{"offset":7,"timestamp":1,"key":null,"value":{"event":"created"},"headers":{}}],"next_offset":8}"#,
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].key, "");
+        assert_eq!(messages[0].value, r#"{"event":"created"}"#);
+        assert_eq!(messages[0].partition, 0);
+        assert_eq!(messages[0].offset, 7);
+    }
+
+    #[test]
+    fn test_merge_partition_messages_is_fair() {
+        let message = |partition, offset| ConsumedMessage {
+            key: String::new(),
+            value: String::new(),
+            partition,
+            offset,
+        };
+        let messages = merge_partition_messages(
+            vec![
+                vec![message(0, 0), message(0, 1), message(0, 2)],
+                vec![message(1, 0), message(1, 1)],
+            ],
+            4,
+        );
+        let positions: Vec<(i32, i64)> = messages
+            .into_iter()
+            .map(|message| (message.partition, message.offset))
+            .collect();
+        assert_eq!(positions, vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
+    }
+
+    #[test]
+    fn test_partition_order_rotates() {
+        assert_eq!(rotated_partition_order(4, 0), vec![0, 1, 2, 3]);
+        assert_eq!(rotated_partition_order(4, 3), vec![3, 0, 1, 2]);
+    }
+
+    #[test]
     fn test_consumed_message_empty_key() {
         let msg = ConsumedMessage {
             key: String::new(),
             value: "data".into(),
+            partition: 0,
             offset: 0,
         };
         let json = serde_json::to_string(&msg).unwrap();
@@ -788,6 +1390,23 @@ mod tests {
         let parsed: ConsumerGroupInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.group_id, "my-group");
         assert_eq!(parsed.topics.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_consumer_group_contracts() {
+        let groups = parse_consumer_groups(
+            r#"[{"group_id":"analytics","state":"Stable","member_count":1,"coordinator":1,"protocol_type":"consumer"}]"#,
+        )
+        .unwrap();
+        assert_eq!(groups[0].members, 1);
+
+        let detail = parse_consumer_group_detail(
+            r#"{"group_id":"analytics","state":"Stable","protocol_type":"consumer","protocol":"range","coordinator":1,"members":[{"member_id":"m1","client_id":"c1","client_host":"127.0.0.1","assignments":[{"topic":"events","partitions":[0]}]}],"offsets":[]}"#,
+            r#"{"group_id":"analytics","state":"Stable","partitions":[{"topic":"events","partition":0,"current_offset":10,"log_end_offset":15,"lag":5}],"total_lag":5}"#,
+        )
+        .unwrap();
+        assert_eq!(detail.members[0].assignments, vec!["events-0"]);
+        assert_eq!(detail.offsets[0].lag, 5);
     }
 
     #[test]
@@ -816,6 +1435,24 @@ mod tests {
         let parsed: SchemaDetail = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.subject, "events-value");
         assert_eq!(parsed.schema_type, "AVRO");
+    }
+
+    #[test]
+    fn test_parse_schema_contracts() {
+        let subjects = parse_schema_subjects(r#"["events-value"]"#).unwrap();
+        assert_eq!(subjects[0].subject, "events-value");
+
+        let avro = parse_schema_detail(
+            r#"{"subject":"events-value","version":1,"id":42,"schema":"{\"type\":\"record\"}"}"#,
+        )
+        .unwrap();
+        assert_eq!(avro.schema_type, "AVRO");
+
+        let json = parse_schema_detail(
+            r#"{"subject":"events-value","version":2,"id":43,"schemaType":"JSON","schema":"{}"}"#,
+        )
+        .unwrap();
+        assert_eq!(json.schema_type, "JSON");
     }
 
     #[test]

@@ -51,6 +51,14 @@ jobs:
       - name: Build frontend
         run: npx vite build
 
+      - name: Build matching Streamline server
+        shell: bash
+        run: |
+          git clone --branch "$GITHUB_REF_NAME" --depth 1 \
+            https://github.com/streamlinelabs/streamline.git streamline-core
+          STREAMLINE_CORE_DIR=streamline-core TARGET="${{ matrix.target }}" \
+            node scripts/build-sidecar.mjs
+
       - name: Build and release Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -61,3 +69,4 @@ jobs:
           releaseBody: 'See the [changelog](https://github.com/streamlinelabs/streamline-desktop/blob/main/CHANGELOG.md) for details.'
           releaseDraft: true
           prerelease: false
+          args: --target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json

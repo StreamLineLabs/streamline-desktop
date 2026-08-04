@@ -38,7 +38,10 @@ npm run dev
 npm run build
 ```
 
-> **Note:** The `streamline` binary must be present in `src-tauri/` (or on your `PATH`) for the embedded server to start. During development you can run the Streamline server manually.
+> **Note:** Production bundles require the platform-matched `streamline` binary
+> under `src-tauri/binaries/` with its Rust target-triple suffix. Source checks
+> and frontend builds do not require it. During development the app can also
+> find `streamline` through `PATH`.
 
 ## Project Structure
 
@@ -119,7 +122,7 @@ controls to the frontend via Tauri commands.
 | Frontend hot-reload | `npm run dev` | Vite dev server proxied by Tauri |
 | Backend rebuild | edit `src-tauri/src/*.rs` | Tauri recompiles on save |
 | Type-check only | `npm run typecheck` | No bundle output |
-| Lint | `npm run lint` | ESLint + Prettier |
+| Frontend tests | `npm test` | Vitest |
 | Production bundle | `npm run build` | `.dmg`, `.AppImage`, `.msi` in `src-tauri/target/release/bundle/` |
 | Tauri-only build | `cargo tauri build` | Same output, more verbose |
 
@@ -133,13 +136,14 @@ Release builds embed a platform-matched `streamline` binary into the app
 bundle. To refresh it locally:
 
 ```bash
-# From the streamline/ repo (next to streamline-desktop/)
-cd ../streamline && cargo build --release
-cp target/release/streamline ../streamline-desktop/src-tauri/binaries/streamline-$(rustc -vV | grep host | awk '{print $2}')
+# Builds ../streamline with the schema-registry feature and stages the
+# target-suffixed sidecar expected by Tauri.
+npm run build:sidecar
 ```
 
-Tauri's bundler picks the binary matching the build target triple
-automatically. See `src-tauri/tauri.conf.json` → `bundle.externalBin`.
+`npm run build` merges `src-tauri/tauri.release.conf.json`, which adds that
+binary as a signed Tauri sidecar. The base Tauri configuration deliberately
+omits the release-only sidecar so Rust checks remain hermetic.
 
 ## Troubleshooting
 
@@ -202,4 +206,3 @@ Desktop-specific notes:
 
 **Beta.** Suitable for local development and demos; not recommended as a
 production cluster manager. Breaking changes possible until 1.0.
-

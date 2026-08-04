@@ -35,13 +35,16 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install frontend dependencies
-        run: npm install
+        run: npm ci
 
       - name: TypeScript check
-        run: npx tsc --noEmit 2>&1 | grep -v "TS7016\|TS7026\|TS2503\|TS2686" | head -50 || true
+        run: npm run typecheck
+
+      - name: Frontend tests
+        run: npm test
 
       - name: Build frontend
-        run: npx vite build
+        run: npm run build:web
 
       - name: Rust format check
         run: cd src-tauri && cargo fmt --all -- --check
@@ -51,3 +54,6 @@ jobs:
 
       - name: Rust build
         run: cd src-tauri && cargo build
+
+      - name: Rust tests
+        run: cd src-tauri && cargo test

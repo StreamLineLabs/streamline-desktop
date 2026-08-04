@@ -6,7 +6,7 @@
   "build": {
     "beforeBuildCommand": "npx vite build",
     "beforeDevCommand": "npx vite dev",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:1420",
     "frontendDist": "../dist"
   },
   "app": {
@@ -36,10 +36,8 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["streamline"],
     "macOS": {
       "minimumSystemVersion": "10.15"
     }
   }
 }
-

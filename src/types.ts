@@ -1,5 +1,6 @@
 // Shared types used across components
 
+import { invoke as tauriInvoke, isTauri } from "@tauri-apps/api/core";
 import type React from "react";
 
 export type Tab = "dashboard" | "topics" | "produce" | "consume" | "groups" | "schemas" | "settings";
@@ -23,18 +24,34 @@ export interface TopicInfo {
   messages: number;
 }
 
+export interface ConsumedMessage {
+  key: string;
+  value: string;
+  partition: number;
+  offset: number;
+}
+
 export interface ServerInfo {
   version: string;
-  uptime: number;
-  topics: number;
-  messages: number;
+  uptime_secs: number;
+  kafka_port: number;
+  http_port: number;
 }
 
 export interface Settings {
+  host: string;
   kafkaPort: number;
   httpPort: number;
   dataDir: string;
   logLevel: string;
+}
+
+export interface ServerSettingsPayload {
+  host: string;
+  kafka_port: number;
+  http_port: number;
+  data_dir: string;
+  log_level: string;
 }
 
 export interface ConsumerGroupInfo {
@@ -97,10 +114,12 @@ export const COLORS = {
   purple: "#9c27b0",
 } as const;
 
-export const IS_TAURI = !!(window as any).__TAURI__?.core?.invoke;
+export const IS_TAURI = isTauri();
 
 export const invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown> =
-  (window as any).__TAURI__?.core?.invoke ??
+  IS_TAURI
+    ? tauriInvoke
+    :
   (async (cmd: string, args?: Record<string, unknown>) => {
     console.warn(`[Streamline Desktop] Tauri not available — "${cmd}" returns preview data`);
     switch (cmd) {
@@ -125,7 +144,7 @@ export const invoke: (cmd: string, args?: Record<string, unknown>) => Promise<un
           { subject: "orders-value", version: 2, schema_type: "AVRO" },
         ];
       case "load_settings":
-        return { kafka_port: 9092, http_port: 9094, data_dir: "./data", log_level: "info" };
+        return { host: "127.0.0.1", kafka_port: 9092, http_port: 9094, data_dir: "./data", log_level: "info" };
       case "start_server":
       case "stop_server":
         return null;
@@ -133,9 +152,9 @@ export const invoke: (cmd: string, args?: Record<string, unknown>) => Promise<un
         return null;
       case "consume_messages":
         return [
-          { key: "user-1", value: '{"action":"click","page":"/home"}', offset: 0 },
-          { key: "user-2", value: '{"action":"signup","email":"alice@example.com"}', offset: 1 },
-          { key: "user-1", value: '{"action":"purchase","item":"widget"}', offset: 2 },
+          { key: "user-1", value: '{"action":"click","page":"/home"}', partition: 0, offset: 0 },
+          { key: "user-2", value: '{"action":"signup","email":"alice@example.com"}', partition: 1, offset: 0 },
+          { key: "user-1", value: '{"action":"purchase","item":"widget"}', partition: 0, offset: 1 },
         ];
       case "create_topic":
         return null;

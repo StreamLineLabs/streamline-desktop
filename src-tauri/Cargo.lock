@@ -3325,10 +3325,12 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "streamline-desktop"
 version = "0.3.0"
 dependencies = [
+ "percent-encoding",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",
+ "tauri-build",
  "tauri-plugin-shell",
  "tokio",
 ]

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, useRef } from "react";
 import {
-  Tab, Toast, ServerStatus, TopicInfo, ServerInfo, Settings,
+  Tab, Toast, ServerStatus, TopicInfo, ConsumedMessage, ServerInfo, Settings,
+  ServerSettingsPayload,
   ConsumerGroupInfo, ConsumerGroupDetail, GroupMember, GroupOffset,
   SchemaSubject, SchemaDetail,
   COLORS, IS_TAURI, invoke, inputStyle, btnStyle, thStyle, tdStyle,
@@ -10,8 +11,19 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("dashboard");
   const [status, setStatus] = useState<ServerStatus>({ running: false, kafka_port: 9092, http_port: 9094 });
   const [topics, setTopics] = useState<TopicInfo[]>([]);
-  const [serverInfo, setServerInfo] = useState<ServerInfo>({ version: "0.2.0", uptime: 0, topics: 0, messages: 0 });
-  const [settings, setSettings] = useState<Settings>({ kafkaPort: 9092, httpPort: 9094, dataDir: "", logLevel: "info" });
+  const [serverInfo, setServerInfo] = useState<ServerInfo>({
+    version: "0.2.0",
+    uptime_secs: 0,
+    kafka_port: 9092,
+    http_port: 9094,
+  });
+  const [settings, setSettings] = useState<Settings>({
+    host: "127.0.0.1",
+    kafkaPort: 9092,
+    httpPort: 9094,
+    dataDir: "",
+    logLevel: "info",
+  });
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastIdRef = useRef(0);
 
@@ -29,7 +41,7 @@ export default function App() {
 
   // Consume state
   const [consumeTopic, setConsumeTopic] = useState("");
-  const [consumeMessages, setConsumeMessages] = useState<Array<{ key: string; value: string; offset: number }>>([]);
+  const [consumeMessages, setConsumeMessages] = useState<ConsumedMessage[]>([]);
 
   const refreshData = useCallback(async () => {
     try {
@@ -50,8 +62,17 @@ export default function App() {
   useEffect(() => {
     refreshData();
     // Load persisted settings on startup
-    invoke("load_settings").then((s: any) => {
-      if (s) setSettings({ kafkaPort: s.kafka_port, httpPort: s.http_port, dataDir: s.data_dir, logLevel: s.log_level });
+    invoke("load_settings").then((value) => {
+      const s = value as ServerSettingsPayload;
+      if (s) {
+        setSettings({
+          host: s.host,
+          kafkaPort: s.kafka_port,
+          httpPort: s.http_port,
+          dataDir: s.data_dir,
+          logLevel: s.log_level,
+        });
+      }
     }).catch((e: unknown) => {
       if (IS_TAURI) console.error("[Streamline Desktop] load_settings failed:", e);
     });
@@ -89,11 +110,10 @@ export default function App() {
   const handleConsume = async () => {
     if (!consumeTopic) return;
     try {
-      const msgs = (await invoke("consume_messages", { topic: consumeTopic, limit: 50 })) as Array<{
-        key: string;
-        value: string;
-        offset: number;
-      }>;
+      const msgs = (await invoke("consume_messages", {
+        topic: consumeTopic,
+        limit: 50,
+      })) as ConsumedMessage[];
       setConsumeMessages(Array.isArray(msgs) ? msgs : []);
     } catch (e) {
       showToast(`Consume failed: ${e}`, "error");
@@ -222,7 +242,7 @@ function DashboardTab({ status, info, topics, formatUptime }: {
   const totalMessages = topics.reduce((sum, t) => sum + t.messages, 0);
   const cards = [
     { label: "Status", value: status.running ? "Running" : "Stopped", color: status.running ? COLORS.green : COLORS.red },
-    { label: "Uptime", value: formatUptime(info.uptime), color: COLORS.blue },
+    { label: "Uptime", value: formatUptime(info.uptime_secs), color: COLORS.blue },
     { label: "Topics", value: String(topics.length), color: COLORS.purple },
     { label: "Messages", value: totalMessages.toLocaleString(), color: COLORS.yellow },
   ];
@@ -378,7 +398,7 @@ function ProduceTab({ topic, setTopic, msgKey, setKey, value, setValue, onSend, 
 
 function ConsumeTab({ topic, setTopic, messages, onFetch, topics }: {
   topic: string; setTopic: (v: string) => void;
-  messages: Array<{ key: string; value: string; offset: number }>;
+  messages: ConsumedMessage[];
   onFetch: () => void; topics: TopicInfo[];
 }) {
   const [expandedRow, setExpandedRow] = useState<number | null>(null);
@@ -416,13 +436,14 @@ function ConsumeTab({ topic, setTopic, messages, onFetch, topics }: {
           <thead>
             <tr style={{ borderBottom: `1px solid ${COLORS.border}`, textAlign: "left" }}>
               <th style={thStyle}>Offset</th>
+              <th style={thStyle}>Partition</th>
               <th style={thStyle}>Key</th>
               <th style={thStyle}>Value</th>
             </tr>
           </thead>
           <tbody>
             {messages.length === 0 ? (
-              <tr><td colSpan={3} style={{ ...tdStyle, color: COLORS.textDim, textAlign: "center" }}>No messages</td></tr>
+              <tr><td colSpan={4} style={{ ...tdStyle, color: COLORS.textDim, textAlign: "center" }}>No messages</td></tr>
             ) : (
               messages.map((m, i) => {
                 const { formatted, isJson } = formatValue(m.value);
@@ -434,6 +455,7 @@ function ConsumeTab({ topic, setTopic, messages, onFetch, topics }: {
                     onClick={() => isJson && setExpandedRow(isExpanded ? null : i)}
                   >
                     <td style={{ ...tdStyle, width: 80 }}>{m.offset}</td>
+                    <td style={{ ...tdStyle, width: 80 }}>{m.partition}</td>
                     <td style={{ ...tdStyle, width: 150, color: COLORS.textDim }}>{m.key || "—"}</td>
                     <td style={{ ...tdStyle, maxWidth: 500 }}>
                       {isExpanded ? (
@@ -791,6 +813,7 @@ function SettingsTab({ settings, setSettings }: { settings: Settings; setSetting
     try {
       await invoke("save_settings", {
         settings: {
+          host: settings.host,
           kafka_port: settings.kafkaPort,
           http_port: settings.httpPort,
           data_dir: settings.dataDir,
@@ -808,6 +831,9 @@ function SettingsTab({ settings, setSettings }: { settings: Settings; setSetting
     <div style={{ maxWidth: 480 }}>
       <h2 style={{ marginTop: 0, fontSize: 24, fontWeight: 600 }}>Server Settings</h2>
       <div style={{ background: COLORS.card, borderRadius: 8, padding: 24 }}>
+        <FieldLabel text="Host">
+          <Input value={settings.host} onChange={(v) => setSettings({ ...settings, host: v })} />
+        </FieldLabel>
         <FieldLabel text="Kafka Port">
           <Input type="number" value={String(settings.kafkaPort)} onChange={(v) => setSettings({ ...settings, kafkaPort: +v })} />
         </FieldLabel>
