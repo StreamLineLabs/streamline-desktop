@@ -191,8 +191,28 @@ npm run build
 ls src-tauri/target/release/bundle/
 ```
 
-Code-signing is required for notarized macOS / signed Windows builds; secrets
-are configured at the org level (see `streamlinelabs/.github`).
+Releases are **fail-closed**: `scripts/check-release-signing.mjs` runs before
+anything is built and aborts the job when a required signing variable is
+missing, so installers can never be published silently unsigned.
+
+| Platform | Required variables (repository/organization secrets) |
+|----------|------------------------------------------------------|
+| macOS | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` |
+| Windows | `WINDOWS_CERTIFICATE`, `WINDOWS_CERTIFICATE_PASSWORD`, `WINDOWS_CERTIFICATE_THUMBPRINT` |
+| Linux | none — Tauri does not code-sign Linux bundles |
+
+Unsigned artifacts are only produced by a manual `workflow_dispatch` run with
+`allow_unsigned = true`. That path uses the separate, manually gated
+`unsigned-dev` environment, never creates a GitHub Release, and uploads its
+output as `UNSIGNED-dev-<target>` workflow artifacts for local testing only.
+Manual runs also record the `streamline_ref` (tag or branch; default `main`)
+used to build the bundled core sidecar. Tag releases ignore that input and
+require the identically named core tag.
+Verify the preflight locally with:
+
+```bash
+node scripts/check-release-signing.mjs --platform darwin   # fails when unset
+```
 
 ## Roadmap
 

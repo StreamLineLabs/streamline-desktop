@@ -57,4 +57,10 @@ cargo fmt --all -- --check
 - Frontend is intentionally minimal — screens are rendered natively from Tauri commands that call the Streamline HTTP API; there is no embedded/iframed web dashboard
 - The bundled `streamline` sidecar is declared in `src-tauri/tauri.release.conf.json` under `bundle.externalBin`
 - Packaged (release) builds require that bundled sidecar and fail closed without it; `STREAMLINE_BINARY`/`PATH` fallbacks exist only in debug builds
+- Tagged releases require `package.json`, both root entries in
+  `package-lock.json`, `src-tauri/Cargo.toml`, the `streamline-desktop` package
+  block in `src-tauri/Cargo.lock`, and `src-tauri/tauri.conf.json` to match the
+  exact tag. SemVer prerelease versions such as `0.4.0-rc.1` are published as
+  GitHub prereleases.
+- Tag releases bundle the matching core tag; manual release-workflow runs require an explicit `streamline_ref` input (default `main`)
 - Ports default to 9092 (Kafka) and 9094 (HTTP) to match the core server defaults
