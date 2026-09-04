@@ -57,7 +57,20 @@ export default function App() {
       if (IS_TAURI) console.error("[Streamline Desktop] refresh failed:", e);
       showToast(`Refresh failed: ${e}`, "error");
     }
-  }, []);
+
+    // Auto-start and tray-start failures happen outside an IPC request from
+    // this window. Drain the backend error slot during the normal status poll
+    // so packaged builds surface missing-sidecar, port, and readiness failures
+    // to the user instead of logging them only to stderr.
+    try {
+      const startupError = await invoke("take_startup_error");
+      if (typeof startupError === "string" && startupError.length > 0) {
+        showToast(startupError, "error");
+      }
+    } catch (e) {
+      if (IS_TAURI) console.error("[Streamline Desktop] take_startup_error failed:", e);
+    }
+  }, [showToast]);
 
   useEffect(() => {
     refreshData();
@@ -76,9 +89,18 @@ export default function App() {
     }).catch((e: unknown) => {
       if (IS_TAURI) console.error("[Streamline Desktop] load_settings failed:", e);
     });
+    // Surface unreadable/invalid persisted settings instead of silently
+    // behaving like a first launch.
+    invoke("get_settings_warning").then((value) => {
+      if (typeof value === "string" && value.length > 0) {
+        showToast(value, "error");
+      }
+    }).catch((e: unknown) => {
+      if (IS_TAURI) console.error("[Streamline Desktop] get_settings_warning failed:", e);
+    });
     const poll = setInterval(refreshData, 5000);
     return () => clearInterval(poll);
-  }, [refreshData]);
+  }, [refreshData, showToast]);
 
   const handleStartStop = async () => {
     try {
@@ -808,6 +830,7 @@ function SchemasTab() {
 
 function SettingsTab({ settings, setSettings }: { settings: Settings; setSettings: (s: Settings) => void }) {
   const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleSave = async () => {
     try {
@@ -820,10 +843,15 @@ function SettingsTab({ settings, setSettings }: { settings: Settings; setSetting
           log_level: settings.logLevel,
         },
       });
+      setError(null);
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
     } catch (e) {
-      console.error("[Streamline Desktop] save settings failed:", e);
+      // The backend rejects non-loopback hosts, conflicting ports and
+      // relative/empty data directories before anything is persisted.
+      setSaved(false);
+      setError(String(e));
+      if (IS_TAURI) console.error("[Streamline Desktop] save settings failed:", e);
     }
   };
 
@@ -856,6 +884,11 @@ function SettingsTab({ settings, setSettings }: { settings: Settings; setSetting
           <button onClick={handleSave} style={btnStyle}>Save Settings</button>
           {saved && <span style={{ fontSize: 13, color: COLORS.green }}>✓ Settings saved</span>}
         </div>
+        {error && (
+          <p role="alert" style={{ fontSize: 13, color: COLORS.red, marginBottom: 0 }}>
+            {error}
+          </p>
+        )}
         <p style={{ fontSize: 12, opacity: 0.6, marginBottom: 0 }}>Changes take effect after restarting the server.</p>
       </div>
     </div>

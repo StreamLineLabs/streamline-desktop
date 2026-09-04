@@ -6,7 +6,8 @@
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -31,6 +32,12 @@ struct ServerState {
     config: Mutex<ServerConfig>,
     consume_cursor: Mutex<HashMap<String, usize>>,
     startup_sequence: AtomicU64,
+    /// Set when persisted settings could not be loaded, so the UI can report it
+    /// instead of silently behaving like a first launch.
+    settings_warning: Mutex<Option<String>>,
+    /// Last background/tray startup failure. The frontend drains this value so
+    /// an auto-start error in a packaged app is visible instead of stderr-only.
+    startup_error: Mutex<Option<String>>,
 }
 
 enum ServerProcess {
@@ -123,22 +130,67 @@ fn streamline_binary_name() -> &'static str {
     }
 }
 
-fn streamline_binary_path() -> PathBuf {
-    // 1. Check STREAMLINE_BINARY env var (explicit override)
-    if let Ok(env_path) = std::env::var("STREAMLINE_BINARY") {
-        return PathBuf::from(env_path);
-    }
+/// Packaged (release) builds must run the sidecar that ships inside the bundle.
+/// `STREAMLINE_BINARY` and `PATH` lookups stay available for development only,
+/// where the sidecar is usually not staged next to the executable.
+fn external_binaries_allowed() -> bool {
+    cfg!(debug_assertions)
+}
 
-    // 2. Tauri external binaries are installed beside the application binary.
-    let mut path = std::env::current_exe().unwrap_or_default();
-    path.pop(); // remove binary name
+/// Path of the Tauri sidecar installed beside the application executable.
+fn bundled_binary_path() -> Option<PathBuf> {
+    let mut path = std::env::current_exe().ok()?;
+    path.pop(); // remove the application binary name
     path.push(streamline_binary_name());
-    if path.exists() {
-        return path;
+    path.exists().then_some(path)
+}
+
+/// Resolve which Streamline executable to spawn.
+///
+/// Release builds fail closed when the bundled sidecar is missing rather than
+/// silently running an arbitrary `streamline` from the user's environment.
+fn resolve_streamline_binary(
+    bundled: Option<PathBuf>,
+    env_override: Option<String>,
+    allow_external: bool,
+) -> Result<PathBuf, String> {
+    if allow_external {
+        if let Some(raw) = env_override.filter(|value| !value.trim().is_empty()) {
+            let path = PathBuf::from(raw);
+            if !path.exists() {
+                return Err(format!(
+                    "STREAMLINE_BINARY points at {}, which does not exist. \
+                     Unset it or point it at a Streamline executable.",
+                    path.display()
+                ));
+            }
+            return Ok(path);
+        }
     }
 
-    // 3. Let Command resolve the executable from PATH on every platform.
-    PathBuf::from(streamline_binary_name())
+    if let Some(path) = bundled {
+        return Ok(path);
+    }
+
+    if allow_external {
+        // Let Command resolve the executable from PATH on every platform.
+        return Ok(PathBuf::from(streamline_binary_name()));
+    }
+
+    Err(format!(
+        "The bundled Streamline server ({}) is missing from this installation. \
+         Reinstall Streamline Desktop from an official release; packaged builds do not \
+         fall back to STREAMLINE_BINARY or PATH.",
+        streamline_binary_name()
+    ))
+}
+
+fn streamline_binary_path() -> Result<PathBuf, String> {
+    resolve_streamline_binary(
+        bundled_binary_path(),
+        std::env::var("STREAMLINE_BINARY").ok(),
+        external_binaries_allowed(),
+    )
 }
 
 fn server_arguments(config: &ServerConfig) -> Vec<String> {
@@ -240,7 +292,10 @@ async fn wait_for_server(
 }
 
 fn spawn_server_process(config: &ServerConfig) -> Result<Child, String> {
-    let bin = streamline_binary_path();
+    // Normalize before spawning so `--listen-addr`/`--http-addr` always receive
+    // a canonical, parseable authority (notably bracketed IPv6 literals).
+    let config = normalized_config(config)?;
+    let bin = streamline_binary_path()?;
     if bin.components().count() > 1 && !bin.exists() {
         return Err(format!("Streamline binary not found at {}", bin.display()));
     }
@@ -248,7 +303,7 @@ fn spawn_server_process(config: &ServerConfig) -> Result<Child, String> {
     std::fs::create_dir_all(&config.data_dir).map_err(|e| e.to_string())?;
 
     Command::new(&bin)
-        .args(server_arguments(config))
+        .args(server_arguments(&config))
         .spawn()
         .map_err(|e| format!("Failed to start Streamline: {e}"))
 }
@@ -319,6 +374,12 @@ fn install_starting_child(
     let _ = child.kill();
     let _ = child.wait();
     Err("Server startup was cancelled".into())
+}
+
+fn record_startup_error(state: &ServerState, error: &str) {
+    let message = format!("Streamline server failed to start: {error}");
+    eprintln!("[streamline-desktop] {message}");
+    *state.startup_error.lock().unwrap() = Some(message);
 }
 
 // ---------------------------------------------------------------------------
@@ -886,23 +947,199 @@ fn settings_path() -> PathBuf {
     p
 }
 
+/// Streamline Desktop runs a local, unauthenticated server, so it must only ever
+/// bind to the loopback interface.
+///
+/// Returns the canonical form that is safe to persist and reuse verbatim:
+/// surrounding whitespace is removed and IPv6 literals are always bracketed, so
+/// the same string is valid both in a URL authority (`http://[::1]:9094`) and in
+/// the server's `--listen-addr` argument (`[::1]:9092`).
+fn normalize_host(host: &str) -> Result<String, String> {
+    let trimmed = host.trim();
+    if trimmed.eq_ignore_ascii_case("localhost") {
+        return Ok(trimmed.to_string());
+    }
+
+    let bracketed = trimmed.strip_prefix('[').and_then(|h| h.strip_suffix(']'));
+    let normalized = match bracketed.unwrap_or(trimmed).parse::<IpAddr>() {
+        // Brackets are the IPv6 literal syntax; `[127.0.0.1]` is not an address.
+        Ok(IpAddr::V4(ip)) if ip.is_loopback() && bracketed.is_none() => Some(ip.to_string()),
+        Ok(IpAddr::V6(ip)) if ip.is_loopback() => Some(format!("[{ip}]")),
+        _ => None,
+    };
+
+    normalized.ok_or_else(|| {
+        format!(
+            "Host \"{trimmed}\" is not a loopback address. Streamline Desktop only serves the \
+             local machine — use 127.0.0.1, localhost, or ::1."
+        )
+    })
+}
+
+const VALID_LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
+
+/// Reject settings that would produce an unstartable or unsafe server, and
+/// return the canonical configuration to persist and use.
+fn normalized_config(config: &ServerConfig) -> Result<ServerConfig, String> {
+    let host = normalize_host(&config.host)?;
+
+    for (label, port) in [
+        ("Kafka port", config.kafka_port),
+        ("HTTP port", config.http_port),
+    ] {
+        if port == 0 {
+            return Err(format!("{label} must be between 1 and 65535."));
+        }
+    }
+
+    if config.kafka_port == config.http_port {
+        return Err(format!(
+            "Kafka port and HTTP port must differ (both are {}).",
+            config.kafka_port
+        ));
+    }
+
+    let data_dir = config.data_dir.trim();
+    if data_dir.is_empty() {
+        return Err("Data directory must not be empty.".into());
+    }
+    if !Path::new(data_dir).is_absolute() {
+        return Err(format!(
+            "Data directory must be an absolute path (got \"{data_dir}\")."
+        ));
+    }
+
+    if !VALID_LOG_LEVELS.contains(&config.log_level.as_str()) {
+        return Err(format!(
+            "Log level \"{}\" is not supported. Use one of: {}.",
+            config.log_level,
+            VALID_LOG_LEVELS.join(", ")
+        ));
+    }
+
+    Ok(ServerConfig {
+        host,
+        ..config.clone()
+    })
+}
+
+/// Result of reading persisted settings: never silently indistinguishable from a
+/// first launch.
+struct SettingsLoad {
+    config: ServerConfig,
+    warning: Option<String>,
+}
+
+/// Move an unusable settings file aside so the user's data is preserved instead
+/// of being overwritten by the next save.
+fn quarantine_settings_file(path: &Path) -> Result<PathBuf, String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let mut quarantined = path.to_path_buf();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "settings.json".into());
+    quarantined.set_file_name(format!("{name}.invalid-{stamp}"));
+    std::fs::rename(path, &quarantined).map_err(|e| e.to_string())?;
+    Ok(quarantined)
+}
+
+fn recover_invalid_settings(path: &Path, reason: String) -> SettingsLoad {
+    let warning = match quarantine_settings_file(path) {
+        Ok(quarantined) => format!(
+            "Saved settings in {} could not be used ({reason}). The file was preserved as {} and \
+             default settings are in use.",
+            path.display(),
+            quarantined.display()
+        ),
+        Err(rename_error) => format!(
+            "Saved settings in {} could not be used ({reason}) and could not be moved aside \
+             ({rename_error}). Default settings are in use; saving settings will overwrite the file.",
+            path.display()
+        ),
+    };
+    SettingsLoad {
+        config: ServerConfig::default(),
+        warning: Some(warning),
+    }
+}
+
+fn load_settings_from_path(path: &Path) -> SettingsLoad {
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return SettingsLoad {
+                config: ServerConfig::default(),
+                warning: None,
+            };
+        }
+        Err(error) => {
+            return SettingsLoad {
+                config: ServerConfig::default(),
+                warning: Some(format!(
+                    "Saved settings in {} could not be read ({error}). Default settings are in use.",
+                    path.display()
+                )),
+            };
+        }
+    };
+
+    match serde_json::from_str::<ServerConfig>(&data) {
+        Ok(config) => match normalized_config(&config) {
+            Ok(config) => SettingsLoad {
+                config,
+                warning: None,
+            },
+            Err(reason) => recover_invalid_settings(path, reason),
+        },
+        Err(error) => recover_invalid_settings(path, format!("invalid JSON: {error}")),
+    }
+}
+
 #[tauri::command]
 fn save_settings(state: State<'_, ServerState>, settings: ServerConfig) -> Result<(), String> {
+    // Persist the canonical form so the stored file, the running server and the
+    // HTTP base URL can never disagree about the host.
+    let settings = normalized_config(&settings)?;
+    let path = settings_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+    }
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(settings_path(), json).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json).map_err(|e| format!("Failed to write {}: {e}", path.display()))?;
     *state.config.lock().unwrap() = settings;
+    *state.settings_warning.lock().unwrap() = None;
     Ok(())
 }
 
 #[tauri::command]
 fn load_settings(state: State<'_, ServerState>) -> ServerConfig {
-    if let Ok(data) = std::fs::read_to_string(settings_path()) {
-        if let Ok(config) = serde_json::from_str::<ServerConfig>(&data) {
-            *state.config.lock().unwrap() = config.clone();
-            return config;
-        }
+    let loaded = load_settings_from_path(&settings_path());
+    if loaded.warning.is_some() {
+        *state.settings_warning.lock().unwrap() = loaded.warning;
+        return state.config.lock().unwrap().clone();
     }
-    state.config.lock().unwrap().clone()
+    *state.config.lock().unwrap() = loaded.config.clone();
+    loaded.config
+}
+
+/// Non-fatal settings problem detected at startup or on load, for the UI to show.
+#[tauri::command]
+fn get_settings_warning(state: State<'_, ServerState>) -> Option<String> {
+    state.settings_warning.lock().unwrap().clone()
+}
+
+/// Drain a startup error recorded by background auto-start or the tray menu.
+///
+/// Taking rather than cloning prevents the five-second frontend poll from
+/// showing the same error repeatedly.
+#[tauri::command]
+fn take_startup_error(state: State<'_, ServerState>) -> Option<String> {
+    state.startup_error.lock().unwrap().take()
 }
 
 // ---------------------------------------------------------------------------
@@ -910,20 +1147,21 @@ fn load_settings(state: State<'_, ServerState>) -> ServerConfig {
 // ---------------------------------------------------------------------------
 
 fn main() {
-    let initial_config = std::fs::read_to_string(settings_path())
-        .ok()
-        .and_then(|data| serde_json::from_str::<ServerConfig>(&data).ok())
-        .unwrap_or_default();
+    let initial = load_settings_from_path(&settings_path());
+    if let Some(warning) = &initial.warning {
+        eprintln!("[streamline-desktop] {warning}");
+    }
 
     let state = ServerState {
         process: Mutex::new(ServerProcess::Stopped),
-        config: Mutex::new(initial_config),
+        config: Mutex::new(initial.config),
         consume_cursor: Mutex::new(HashMap::new()),
         startup_sequence: AtomicU64::new(0),
+        settings_warning: Mutex::new(initial.warning),
+        startup_error: Mutex::new(None),
     };
 
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
         .manage(state)
         .setup(|app| {
             // --- System tray ---------------------------------------------------
@@ -945,7 +1183,9 @@ fn main() {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
                             let state = app.state::<ServerState>();
-                            let _ = start_server(state).await;
+                            if let Err(error) = start_server(state.clone()).await {
+                                record_startup_error(&state, &error);
+                            }
                         });
                     }
                     "stop" => {
@@ -966,8 +1206,8 @@ fn main() {
             let app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let state = app.state::<ServerState>();
-                if let Err(e) = start_server(state).await {
-                    eprintln!("Auto-start failed (expected during development): {e}");
+                if let Err(error) = start_server(state.clone()).await {
+                    record_startup_error(&state, &error);
                 }
             });
 
@@ -990,6 +1230,8 @@ fn main() {
             get_schema,
             save_settings,
             load_settings,
+            get_settings_warning,
+            take_startup_error,
         ])
         .build(tauri::generate_context!())
         .expect("error while running Streamline Desktop");
@@ -1352,5 +1594,345 @@ mod tests {
             !dir.is_empty(),
             "default_data_dir should return a non-empty string"
         );
+    }
+
+    // -- Sidecar resolution policy -----------------------------------------
+
+    #[test]
+    fn test_release_builds_require_the_bundled_sidecar() {
+        let error = resolve_streamline_binary(None, Some("/opt/streamline".into()), false)
+            .expect_err("packaged builds must not fall back to an external binary");
+        assert!(error.contains("bundled Streamline server"), "{error}");
+        assert!(error.contains("Reinstall"), "{error}");
+    }
+
+    #[test]
+    fn test_release_builds_use_the_bundled_sidecar() {
+        let bundled = PathBuf::from("/Applications/Streamline.app/Contents/MacOS/streamline");
+        let resolved =
+            resolve_streamline_binary(Some(bundled.clone()), Some("/opt/streamline".into()), false)
+                .unwrap();
+        assert_eq!(resolved, bundled);
+    }
+
+    #[test]
+    fn test_development_prefers_existing_env_override() {
+        let override_path = std::env::current_exe().unwrap();
+        let resolved = resolve_streamline_binary(
+            Some(PathBuf::from("/bundled/streamline")),
+            Some(override_path.to_string_lossy().into_owned()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(resolved, override_path);
+    }
+
+    #[test]
+    fn test_development_rejects_missing_env_override() {
+        let error =
+            resolve_streamline_binary(None, Some("/definitely/not/here/streamline".into()), true)
+                .expect_err("a broken STREAMLINE_BINARY should be reported, not ignored");
+        assert!(error.contains("STREAMLINE_BINARY"), "{error}");
+    }
+
+    #[test]
+    fn test_development_falls_back_to_path_lookup() {
+        let resolved = resolve_streamline_binary(None, None, true).unwrap();
+        assert_eq!(resolved, PathBuf::from(streamline_binary_name()));
+    }
+
+    #[test]
+    fn test_blank_env_override_is_ignored() {
+        let resolved = resolve_streamline_binary(None, Some("   ".into()), true).unwrap();
+        assert_eq!(resolved, PathBuf::from(streamline_binary_name()));
+    }
+
+    // -- Settings validation ------------------------------------------------
+
+    fn valid_config() -> ServerConfig {
+        ServerConfig {
+            host: "127.0.0.1".into(),
+            kafka_port: 9092,
+            http_port: 9094,
+            data_dir: if cfg!(target_os = "windows") {
+                "C:\\ProgramData\\streamline".into()
+            } else {
+                "/var/lib/streamline".into()
+            },
+            log_level: "info".into(),
+        }
+    }
+
+    #[test]
+    fn test_default_config_is_valid() {
+        let config = ServerConfig::default();
+        // The OS data directory is absolute on every supported platform; the
+        // relative "./data" fallback only appears when HOME/APPDATA is unset.
+        if Path::new(&config.data_dir).is_absolute() {
+            normalized_config(&config).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_loopback_hosts_are_accepted() {
+        for host in ["127.0.0.1", "localhost", "LOCALHOST", "::1", "[::1]"] {
+            let config = ServerConfig {
+                host: host.into(),
+                ..valid_config()
+            };
+            normalized_config(&config).unwrap_or_else(|e| panic!("{host} should be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_host_is_trimmed_before_persistence_and_use() {
+        for raw in ["  127.0.0.1 ", "\t127.0.0.1\n"] {
+            let normalized = normalized_config(&ServerConfig {
+                host: raw.into(),
+                ..valid_config()
+            })
+            .unwrap_or_else(|e| panic!("{raw:?} should be valid: {e}"));
+
+            assert_eq!(normalized.host, "127.0.0.1");
+            assert_eq!(http_base_url(&normalized), "http://127.0.0.1:9094");
+            assert_eq!(server_arguments(&normalized)[1], "127.0.0.1:9092");
+        }
+    }
+
+    /// A bare `::1` is a valid address but not a valid URL authority or
+    /// `host:port` pair, so it must be normalized to the bracketed form.
+    #[test]
+    fn test_bare_ipv6_loopback_is_normalized_to_brackets() {
+        for raw in ["::1", " ::1 ", "[::1]", "0:0:0:0:0:0:0:1"] {
+            let normalized = normalized_config(&ServerConfig {
+                host: raw.into(),
+                ..valid_config()
+            })
+            .unwrap_or_else(|e| panic!("{raw:?} should be valid: {e}"));
+
+            assert_eq!(normalized.host, "[::1]", "{raw:?}");
+            assert_eq!(http_base_url(&normalized), "http://[::1]:9094");
+            let arguments = server_arguments(&normalized);
+            assert_eq!(arguments[1], "[::1]:9092");
+            assert_eq!(arguments[3], "[::1]:9094");
+            // The normalized authority must round-trip through a real parser.
+            reqwest::Url::parse(&http_base_url(&normalized)).unwrap();
+            arguments[1].parse::<std::net::SocketAddr>().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_localhost_and_ipv4_keep_working_end_to_end() {
+        for (raw, expected) in [
+            ("localhost", "localhost"),
+            ("LOCALHOST", "LOCALHOST"),
+            ("127.0.0.1", "127.0.0.1"),
+        ] {
+            let normalized = normalized_config(&ServerConfig {
+                host: raw.into(),
+                ..valid_config()
+            })
+            .unwrap_or_else(|e| panic!("{raw} should be valid: {e}"));
+
+            assert_eq!(normalized.host, expected);
+            assert_eq!(
+                http_base_url(&normalized),
+                format!("http://{expected}:9094")
+            );
+            assert_eq!(server_arguments(&normalized)[1], format!("{expected}:9092"));
+            reqwest::Url::parse(&http_base_url(&normalized)).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_non_loopback_hosts_are_rejected() {
+        for host in ["0.0.0.0", "192.168.1.10", "example.com", ""] {
+            let config = ServerConfig {
+                host: host.into(),
+                ..valid_config()
+            };
+            assert!(
+                normalized_config(&config).is_err(),
+                "{host} must not be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_malformed_and_non_loopback_literals_are_rejected() {
+        for host in [
+            "   ",
+            "[127.0.0.1]",    // brackets are IPv6-only syntax
+            "[::1",           // unbalanced
+            "::1]",           // unbalanced
+            "[localhost]",    // not an IP literal
+            "[::2]",          // not loopback
+            "::",             // unspecified, not loopback
+            "127.0.0.1:9092", // host only, no port
+            "[fe80::1]",      // link-local, not loopback
+            "local host",
+        ] {
+            assert!(
+                normalized_config(&ServerConfig {
+                    host: host.into(),
+                    ..valid_config()
+                })
+                .is_err(),
+                "{host:?} must not be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_conflicting_ports_are_rejected() {
+        let config = ServerConfig {
+            http_port: 9092,
+            ..valid_config()
+        };
+        let error = normalized_config(&config).unwrap_err();
+        assert!(error.contains("must differ"), "{error}");
+    }
+
+    #[test]
+    fn test_zero_ports_are_rejected() {
+        let kafka = ServerConfig {
+            kafka_port: 0,
+            ..valid_config()
+        };
+        assert!(normalized_config(&kafka).is_err());
+        let http = ServerConfig {
+            http_port: 0,
+            ..valid_config()
+        };
+        assert!(normalized_config(&http).is_err());
+    }
+
+    #[test]
+    fn test_empty_and_relative_data_dirs_are_rejected() {
+        for data_dir in ["", "   ", "./data", "data"] {
+            let config = ServerConfig {
+                data_dir: data_dir.into(),
+                ..valid_config()
+            };
+            assert!(
+                normalized_config(&config).is_err(),
+                "{data_dir:?} must not be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_log_level_is_rejected() {
+        let config = ServerConfig {
+            log_level: "verbose".into(),
+            ..valid_config()
+        };
+        assert!(normalized_config(&config).is_err());
+    }
+
+    // -- Settings loading and recovery --------------------------------------
+
+    /// Unique scratch directory; avoids adding a dev-dependency for temp files.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("streamline-desktop-{name}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Settings fixture whose `data_dir` is absolute on the current platform.
+    /// Hand-written JSON with a Unix path ("/tmp/x") is a *relative* path on
+    /// Windows, so such a fixture would be rejected for the wrong reason there.
+    /// Serializing through serde also escapes the backslashes in Windows paths.
+    fn settings_json_with_host(host: &str) -> String {
+        serde_json::to_string(&ServerConfig {
+            host: host.into(),
+            ..valid_config()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_missing_settings_file_is_a_clean_first_launch() {
+        let dir = scratch_dir("missing");
+        let loaded = load_settings_from_path(&dir.join("settings.json"));
+        assert!(loaded.warning.is_none());
+        assert_eq!(loaded.config.kafka_port, 9092);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_valid_settings_file_round_trips() {
+        let dir = scratch_dir("valid");
+        let path = dir.join("settings.json");
+        let config = valid_config();
+        std::fs::write(&path, serde_json::to_string(&config).unwrap()).unwrap();
+
+        let loaded = load_settings_from_path(&path);
+        assert!(loaded.warning.is_none());
+        assert_eq!(loaded.config.data_dir, config.data_dir);
+        assert!(path.exists(), "valid settings must not be quarantined");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_corrupt_settings_file_is_quarantined_and_reported() {
+        let dir = scratch_dir("corrupt");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{ not json").unwrap();
+
+        let loaded = load_settings_from_path(&path);
+        let warning = loaded.warning.expect("corruption must be surfaced");
+        assert!(warning.contains("invalid JSON"), "{warning}");
+        assert!(!path.exists(), "corrupt file must be moved aside");
+
+        let preserved: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.json.invalid-")
+            })
+            .collect();
+        assert_eq!(preserved.len(), 1, "the original bytes must be preserved");
+        assert_eq!(
+            std::fs::read_to_string(preserved[0].path()).unwrap(),
+            "{ not json"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_invalid_settings_values_are_quarantined() {
+        let dir = scratch_dir("invalid-values");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, settings_json_with_host("0.0.0.0")).unwrap();
+
+        let loaded = load_settings_from_path(&path);
+        let warning = loaded.warning.expect("invalid settings must be surfaced");
+        assert!(warning.contains("loopback"), "{warning}");
+        assert_eq!(loaded.config.host, "127.0.0.1");
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_loaded_settings_host_is_normalized_not_quarantined() {
+        let dir = scratch_dir("normalize-host");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, settings_json_with_host(" ::1 ")).unwrap();
+
+        let loaded = load_settings_from_path(&path);
+        assert!(loaded.warning.is_none(), "{:?}", loaded.warning);
+        assert_eq!(loaded.config.host, "[::1]");
+        assert_eq!(http_base_url(&loaded.config), "http://[::1]:9094");
+        assert_eq!(server_arguments(&loaded.config)[1], "[::1]:9092");
+        assert!(path.exists(), "a normalizable host must not be quarantined");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

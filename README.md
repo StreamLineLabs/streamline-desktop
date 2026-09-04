@@ -14,7 +14,7 @@ Streamline Desktop wraps the [Streamline](https://github.com/streamlinelabs/stre
 
 - **Zero-config server** — starts an embedded Streamline instance automatically
 - **System tray** — Start / Stop / Quit from the tray icon
-- **Web dashboard** — embeds the Streamline HTTP dashboard in-app
+- **Native operations UI** — dashboard, topics, produce/consume, consumer groups and schemas rendered natively (the Streamline HTTP dashboard is not embedded)
 - **Cross-platform** — macOS, Linux, Windows
 
 ## Prerequisites
@@ -40,8 +40,11 @@ npm run build
 
 > **Note:** Production bundles require the platform-matched `streamline` binary
 > under `src-tauri/binaries/` with its Rust target-triple suffix. Source checks
-> and frontend builds do not require it. During development the app can also
-> find `streamline` through `PATH`.
+> and frontend builds do not require it. Packaged builds **only** run the
+> bundled sidecar: if it is missing, startup fails with an actionable error
+> shown in the application instead of falling back to another `streamline` on
+> the machine or disappearing into stderr. The
+> `STREAMLINE_BINARY` override and `PATH` lookup are development-only.
 
 ## Project Structure
 
@@ -88,9 +91,23 @@ Apache-2.0
 | `STREAMLINE_THEME` | UI theme (light/dark/system) | `system` |
 | `STREAMLINE_LOG_LEVEL` | Log verbosity | `info` |
 | `STREAMLINE_DATA_DIR` | Override embedded data directory | OS app-data dir |
-| `STREAMLINE_HTTP_PORT` | HTTP/dashboard port for the embedded server | `9094` |
+| `STREAMLINE_HTTP_PORT` | HTTP API port for the embedded server | `9094` |
 | `STREAMLINE_KAFKA_PORT` | Kafka protocol port for the embedded server | `9092` |
-| `TAURI_PRIVATE_KEY` | Code-signing key (release builds only) | _unset_ |
+| `STREAMLINE_BINARY` | Development-only override for the server executable (ignored by packaged builds) | _unset_ |
+
+### Settings validation
+
+Persisted settings (`settings.json` in the OS app-data directory) are validated
+before they are saved or used:
+
+- `host` must be a loopback address (`127.0.0.1`, `localhost`, `::1`)
+- `kafka_port` and `http_port` must be non-zero and different from each other
+- `data_dir` must be a non-empty absolute path
+- `log_level` must be one of `trace`, `debug`, `info`, `warn`, `error`
+
+Invalid or corrupt settings are never silently treated as a first launch: the
+file is preserved as `settings.json.invalid-<timestamp>`, defaults are used for
+the session, and the app reports the problem in the UI.
 
 ## Architecture
 
@@ -112,8 +129,9 @@ Apache-2.0
 ```
 
 The Rust backend launches the bundled `streamline` binary as a child process,
-streams its stdout/stderr into the in-app log viewer, and exposes start/stop
-controls to the frontend via Tauri commands.
+waits for its readiness endpoint, and exposes start/stop controls to the
+frontend via Tauri commands. The child process inherits the app's stdout/stderr
+(there is no in-app log viewer yet).
 
 ## Inner Loop
 

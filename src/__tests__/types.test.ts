@@ -267,6 +267,21 @@ describe("Preview Mode Invoke Mock", () => {
     expect(result.log_level).toBeTruthy();
   });
 
+  it("load_settings preview data satisfies the backend validation policy", async () => {
+    const result = (await invoke("load_settings")) as Record<string, unknown>;
+    expect(["127.0.0.1", "localhost", "::1"]).toContain(result.host);
+    expect(result.kafka_port).not.toBe(result.http_port);
+    expect(String(result.data_dir).startsWith("/")).toBe(true);
+  });
+
+  it("get_settings_warning returns null in preview mode", async () => {
+    expect(await invoke("get_settings_warning")).toBeNull();
+  });
+
+  it("take_startup_error returns null in preview mode", async () => {
+    expect(await invoke("take_startup_error")).toBeNull();
+  });
+
   it("start_server returns null without error", async () => {
     const result = await invoke("start_server");
     expect(result).toBeNull();

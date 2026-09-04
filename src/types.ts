@@ -144,7 +144,9 @@ export const invoke: (cmd: string, args?: Record<string, unknown>) => Promise<un
           { subject: "orders-value", version: 2, schema_type: "AVRO" },
         ];
       case "load_settings":
-        return { host: "127.0.0.1", kafka_port: 9092, http_port: 9094, data_dir: "./data", log_level: "info" };
+        // Preview fixture mirrors the backend policy: loopback host, distinct
+        // ports and an absolute data directory.
+        return { host: "127.0.0.1", kafka_port: 9092, http_port: 9094, data_dir: "/var/lib/streamline", log_level: "info" };
       case "start_server":
       case "stop_server":
         return null;
@@ -182,6 +184,9 @@ export const invoke: (cmd: string, args?: Record<string, unknown>) => Promise<un
           compatibility: "BACKWARD",
         };
       case "save_settings":
+        return null;
+      case "get_settings_warning":
+      case "take_startup_error":
         return null;
       default:
         console.error(`[Streamline Desktop] Unhandled command in preview mode: "${cmd}"`);
