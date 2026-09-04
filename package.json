@@ -1,6 +1,6 @@
 {
   "name": "streamline-desktop",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Streamline Desktop - The Redis of Streaming on your desktop",
   "private": true,
   "scripts": {
