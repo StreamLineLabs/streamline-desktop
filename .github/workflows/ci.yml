@@ -65,7 +65,7 @@ jobs:
         run: cd src-tauri && cargo test --locked
 
   dependencies:
-    name: Dependency review
+    name: Package audits
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -74,6 +74,8 @@ jobs:
         with:
           node-version: "20"
           cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
 
       # Fails the build on known-vulnerable runtime dependencies. Dev-only
       # advisories are reported by `npm audit` locally but do not ship.
@@ -88,9 +90,20 @@ jobs:
       - name: Lockfile consistency
         run: npm ci --dry-run
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Rust dependency audit
+        run: cargo audit --file src-tauri/Cargo.lock
+
   dependency-review:
-    name: Dependency review (pull requests)
-    if: github.event_name == 'pull_request'
+    name: Dependency review (opt-in)
+    # The action requires the repository dependency graph. An unset variable
+    # leaves this job neutrally skipped; the native npm and Rust audits above
+    # remain mandatory and fail closed.
+    if: >-
+      github.event_name == 'pull_request' &&
+      vars.DEPENDENCY_REVIEW_ENABLED == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read

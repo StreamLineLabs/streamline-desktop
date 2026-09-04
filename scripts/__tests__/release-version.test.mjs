@@ -1,11 +1,4 @@
-import {
-  cpSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import * as fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -14,21 +7,23 @@ import { validateReleaseVersion } from "../check-release-version.mjs";
 const roots = [];
 
 function fixture() {
-  const root = mkdtempSync(path.join(os.tmpdir(), "streamline-desktop-version-"));
+  const root = fs.mkdtempSync(
+    path.join(os.tmpdir(), "streamline-desktop-version-"),
+  );
   roots.push(root);
-  cpSync("package.json", path.join(root, "package.json"));
-  cpSync("package-lock.json", path.join(root, "package-lock.json"));
+  fs.cpSync("package.json", path.join(root, "package.json"));
+  fs.cpSync("package-lock.json", path.join(root, "package-lock.json"));
   const tauri = path.join(root, "src-tauri");
-  mkdirSync(tauri);
-  cpSync("src-tauri/Cargo.toml", path.join(tauri, "Cargo.toml"), {
+  fs.mkdirSync(tauri);
+  fs.cpSync("src-tauri/Cargo.toml", path.join(tauri, "Cargo.toml"), {
     recursive: false,
     force: true,
   });
-  cpSync("src-tauri/Cargo.lock", path.join(tauri, "Cargo.lock"), {
+  fs.cpSync("src-tauri/Cargo.lock", path.join(tauri, "Cargo.lock"), {
     recursive: false,
     force: true,
   });
-  cpSync("src-tauri/tauri.conf.json", path.join(tauri, "tauri.conf.json"), {
+  fs.cpSync("src-tauri/tauri.conf.json", path.join(tauri, "tauri.conf.json"), {
     recursive: false,
     force: true,
   });
@@ -37,7 +32,7 @@ function fixture() {
 
 afterEach(() => {
   for (const root of roots.splice(0)) {
-    rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -48,32 +43,46 @@ describe("desktop release version contract", () => {
     expect(result.prerelease).toBe(false);
   });
 
+  it("accepts a Cargo.lock fixture with CRLF line endings", () => {
+    const root = fixture();
+    const cargoLock = path.join(root, "src-tauri/Cargo.lock");
+    const crlf = fs
+      .readFileSync(cargoLock, "utf8")
+      .replace(/\r\n?/g, "\n")
+      .replaceAll("\n", "\r\n");
+    fs.writeFileSync(cargoLock, crlf);
+
+    expect(crlf).toContain("\r\n");
+    const result = validateReleaseVersion(root, "v0.4.0");
+    expect(result.version).toBe("0.4.0");
+  });
+
   it("marks a matching semantic prerelease tag as a prerelease", () => {
     const root = fixture();
     for (const file of ["package.json", "src-tauri/tauri.conf.json"]) {
       const pathname = path.join(root, file);
-      writeFileSync(
+      fs.writeFileSync(
         pathname,
-        readFileSync(pathname, "utf8").replaceAll("0.4.0", "0.4.0-rc.1"),
+        fs.readFileSync(pathname, "utf8").replaceAll("0.4.0", "0.4.0-rc.1"),
       );
     }
     const lock = path.join(root, "package-lock.json");
-    writeFileSync(
+    fs.writeFileSync(
       lock,
-      readFileSync(lock, "utf8").replaceAll("0.4.0", "0.4.0-rc.1"),
+      fs.readFileSync(lock, "utf8").replaceAll("0.4.0", "0.4.0-rc.1"),
     );
     const cargo = path.join(root, "src-tauri/Cargo.toml");
-    writeFileSync(
+    fs.writeFileSync(
       cargo,
-      readFileSync(cargo, "utf8").replace(
+      fs.readFileSync(cargo, "utf8").replace(
         'version = "0.4.0"',
         'version = "0.4.0-rc.1"',
       ),
     );
     const cargoLock = path.join(root, "src-tauri/Cargo.lock");
-    writeFileSync(
+    fs.writeFileSync(
       cargoLock,
-      readFileSync(cargoLock, "utf8").replace(
+      fs.readFileSync(cargoLock, "utf8").replace(
         'name = "streamline-desktop"\nversion = "0.4.0"',
         'name = "streamline-desktop"\nversion = "0.4.0-rc.1"',
       ),
@@ -95,31 +104,40 @@ describe("desktop release version contract", () => {
     const root = fixture();
     if (authority === "package.json") {
       const file = path.join(root, "package.json");
-      writeFileSync(file, readFileSync(file, "utf8").replace("0.4.0", "0.4.1"));
+      fs.writeFileSync(
+        file,
+        fs.readFileSync(file, "utf8").replace("0.4.0", "0.4.1"),
+      );
     } else if (authority.startsWith("package-lock")) {
       const file = path.join(root, "package-lock.json");
-      const lock = JSON.parse(readFileSync(file, "utf8"));
+      const lock = JSON.parse(fs.readFileSync(file, "utf8"));
       if (authority.includes('packages[""]')) {
         lock.packages[""].version = "0.4.1";
       } else {
         lock.version = "0.4.1";
       }
-      writeFileSync(file, `${JSON.stringify(lock, null, 2)}\n`);
+      fs.writeFileSync(file, `${JSON.stringify(lock, null, 2)}\n`);
     } else if (authority.endsWith("Cargo.toml")) {
       const file = path.join(root, "src-tauri/Cargo.toml");
-      writeFileSync(file, readFileSync(file, "utf8").replace("0.4.0", "0.4.1"));
+      fs.writeFileSync(
+        file,
+        fs.readFileSync(file, "utf8").replace("0.4.0", "0.4.1"),
+      );
     } else if (authority.includes("Cargo.lock")) {
       const file = path.join(root, "src-tauri/Cargo.lock");
-      writeFileSync(
+      fs.writeFileSync(
         file,
-        readFileSync(file, "utf8").replace(
+        fs.readFileSync(file, "utf8").replace(
           'name = "streamline-desktop"\nversion = "0.4.0"',
           'name = "streamline-desktop"\nversion = "0.4.1"',
         ),
       );
     } else {
       const file = path.join(root, "src-tauri/tauri.conf.json");
-      writeFileSync(file, readFileSync(file, "utf8").replace("0.4.0", "0.4.1"));
+      fs.writeFileSync(
+        file,
+        fs.readFileSync(file, "utf8").replace("0.4.0", "0.4.1"),
+      );
     }
 
     expect(() => validateReleaseVersion(root, "v0.4.0")).toThrow(

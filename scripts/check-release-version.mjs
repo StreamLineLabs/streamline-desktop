@@ -20,6 +20,7 @@ function cargoPackageVersion(source) {
 
 function cargoLockPackageVersion(source, packageName) {
   const matches = source
+    .replace(/\r\n?/g, "\n")
     .split(/\n\n+/)
     .filter(
       (block) =>

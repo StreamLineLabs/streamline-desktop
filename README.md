@@ -144,6 +144,14 @@ frontend via Tauri commands. The child process inherits the app's stdout/stderr
 | Production bundle | `npm run build` | `.dmg`, `.AppImage`, `.msi` in `src-tauri/target/release/bundle/` |
 | Tauri-only build | `cargo tauri build` | Same output, more verbose |
 
+### Dependency security checks
+
+CI always runs fail-closed audits for production npm dependencies and the
+committed Rust lockfile. GitHub's dependency-review action additionally runs
+on pull requests only when the repository variable
+`DEPENDENCY_REVIEW_ENABLED=true`; without that repository capability, its job
+is neutrally skipped rather than reported as a successful review.
+
 Cold start (first build) typically takes 4–7 minutes due to Rust compilation;
 incremental rebuilds during development are < 5 s for frontend changes and
 < 30 s for backend changes.
