@@ -2,8 +2,10 @@
 *.ts text diff=typescript
 *.tsx text diff=typescript
 *.js text
+*.mjs text eol=lf
 *.rs text diff=rust
 *.md text diff=markdown
 *.sh text eol=lf
+src-tauri/Cargo.lock text eol=lf
 package-lock.json linguist-generated=true
 dist/ linguist-generated=true

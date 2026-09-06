@@ -18,7 +18,12 @@ jobs:
             deps: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
           - os: macos-latest
             deps: echo "No extra deps needed on macOS"
+          - os: windows-latest
+            deps: echo "No extra deps needed on Windows"
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -35,13 +40,16 @@ jobs:
           components: clippy, rustfmt
 
       - name: Install frontend dependencies
-        run: npm install
+        run: npm ci
 
       - name: TypeScript check
-        run: npx tsc --noEmit 2>&1 | grep -v "TS7016\|TS7026\|TS2503\|TS2686" | head -50 || true
+        run: npm run typecheck
+
+      - name: Frontend tests
+        run: npm test
 
       - name: Build frontend
-        run: npx vite build
+        run: npm run build:web
 
       - name: Rust format check
         run: cd src-tauri && cargo fmt --all -- --check
@@ -49,5 +57,58 @@ jobs:
       - name: Rust lint
         run: cd src-tauri && cargo clippy --all-targets -- -D warnings
 
+      # --locked fails the build if Cargo.lock is stale or tampered with.
       - name: Rust build
-        run: cd src-tauri && cargo build
+        run: cd src-tauri && cargo build --locked
+
+      - name: Rust tests
+        run: cd src-tauri && cargo test --locked
+
+  dependencies:
+    name: Package audits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Fails the build on known-vulnerable runtime dependencies. Dev-only
+      # advisories are reported by `npm audit` locally but do not ship.
+      - name: npm audit (production dependencies)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: npm audit (all dependencies, advisory only)
+        run: npm audit --audit-level=high || true
+
+      # Verifies package.json and package-lock.json stay in sync without
+      # installing anything into the workspace.
+      - name: Lockfile consistency
+        run: npm ci --dry-run
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Rust dependency audit
+        run: cargo audit --file src-tauri/Cargo.lock
+
+  dependency-review:
+    name: Dependency review (opt-in)
+    # The action requires the repository dependency graph. An unset variable
+    # leaves this job neutrally skipped; the native npm and Rust audits above
+    # remain mandatory and fail closed.
+    if: >-
+      github.event_name == 'pull_request' &&
+      vars.DEPENDENCY_REVIEW_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high

@@ -3,6 +3,7 @@ import { describe, it, expect, vi } from "vitest";
 // Mock Tauri invoke API before importing anything that uses it
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
+  isTauri: vi.fn(() => false),
 }));
 
 describe("StreamlineDesktop", () => {

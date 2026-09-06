@@ -14,7 +14,7 @@ Streamline Desktop wraps the [Streamline](https://github.com/streamlinelabs/stre
 
 - **Zero-config server** — starts an embedded Streamline instance automatically
 - **System tray** — Start / Stop / Quit from the tray icon
-- **Web dashboard** — embeds the Streamline HTTP dashboard in-app
+- **Native operations UI** — dashboard, topics, produce/consume, consumer groups and schemas rendered natively (the Streamline HTTP dashboard is not embedded)
 - **Cross-platform** — macOS, Linux, Windows
 
 ## Prerequisites
@@ -38,7 +38,13 @@ npm run dev
 npm run build
 ```
 
-> **Note:** The `streamline` binary must be present in `src-tauri/` (or on your `PATH`) for the embedded server to start. During development you can run the Streamline server manually.
+> **Note:** Production bundles require the platform-matched `streamline` binary
+> under `src-tauri/binaries/` with its Rust target-triple suffix. Source checks
+> and frontend builds do not require it. Packaged builds **only** run the
+> bundled sidecar: if it is missing, startup fails with an actionable error
+> shown in the application instead of falling back to another `streamline` on
+> the machine or disappearing into stderr. The
+> `STREAMLINE_BINARY` override and `PATH` lookup are development-only.
 
 ## Project Structure
 
@@ -85,9 +91,23 @@ Apache-2.0
 | `STREAMLINE_THEME` | UI theme (light/dark/system) | `system` |
 | `STREAMLINE_LOG_LEVEL` | Log verbosity | `info` |
 | `STREAMLINE_DATA_DIR` | Override embedded data directory | OS app-data dir |
-| `STREAMLINE_HTTP_PORT` | HTTP/dashboard port for the embedded server | `9094` |
+| `STREAMLINE_HTTP_PORT` | HTTP API port for the embedded server | `9094` |
 | `STREAMLINE_KAFKA_PORT` | Kafka protocol port for the embedded server | `9092` |
-| `TAURI_PRIVATE_KEY` | Code-signing key (release builds only) | _unset_ |
+| `STREAMLINE_BINARY` | Development-only override for the server executable (ignored by packaged builds) | _unset_ |
+
+### Settings validation
+
+Persisted settings (`settings.json` in the OS app-data directory) are validated
+before they are saved or used:
+
+- `host` must be a loopback address (`127.0.0.1`, `localhost`, `::1`)
+- `kafka_port` and `http_port` must be non-zero and different from each other
+- `data_dir` must be a non-empty absolute path
+- `log_level` must be one of `trace`, `debug`, `info`, `warn`, `error`
+
+Invalid or corrupt settings are never silently treated as a first launch: the
+file is preserved as `settings.json.invalid-<timestamp>`, defaults are used for
+the session, and the app reports the problem in the UI.
 
 ## Architecture
 
@@ -109,8 +129,9 @@ Apache-2.0
 ```
 
 The Rust backend launches the bundled `streamline` binary as a child process,
-streams its stdout/stderr into the in-app log viewer, and exposes start/stop
-controls to the frontend via Tauri commands.
+waits for its readiness endpoint, and exposes start/stop controls to the
+frontend via Tauri commands. The child process inherits the app's stdout/stderr
+(there is no in-app log viewer yet).
 
 ## Inner Loop
 
@@ -119,9 +140,17 @@ controls to the frontend via Tauri commands.
 | Frontend hot-reload | `npm run dev` | Vite dev server proxied by Tauri |
 | Backend rebuild | edit `src-tauri/src/*.rs` | Tauri recompiles on save |
 | Type-check only | `npm run typecheck` | No bundle output |
-| Lint | `npm run lint` | ESLint + Prettier |
+| Frontend tests | `npm test` | Vitest |
 | Production bundle | `npm run build` | `.dmg`, `.AppImage`, `.msi` in `src-tauri/target/release/bundle/` |
 | Tauri-only build | `cargo tauri build` | Same output, more verbose |
+
+### Dependency security checks
+
+CI always runs fail-closed audits for production npm dependencies and the
+committed Rust lockfile. GitHub's dependency-review action additionally runs
+on pull requests only when the repository variable
+`DEPENDENCY_REVIEW_ENABLED=true`; without that repository capability, its job
+is neutrally skipped rather than reported as a successful review.
 
 Cold start (first build) typically takes 4–7 minutes due to Rust compilation;
 incremental rebuilds during development are < 5 s for frontend changes and
@@ -133,13 +162,14 @@ Release builds embed a platform-matched `streamline` binary into the app
 bundle. To refresh it locally:
 
 ```bash
-# From the streamline/ repo (next to streamline-desktop/)
-cd ../streamline && cargo build --release
-cp target/release/streamline ../streamline-desktop/src-tauri/binaries/streamline-$(rustc -vV | grep host | awk '{print $2}')
+# Builds ../streamline with the schema-registry feature and stages the
+# target-suffixed sidecar expected by Tauri.
+npm run build:sidecar
 ```
 
-Tauri's bundler picks the binary matching the build target triple
-automatically. See `src-tauri/tauri.conf.json` → `bundle.externalBin`.
+`npm run build` merges `src-tauri/tauri.release.conf.json`, which adds that
+binary as a signed Tauri sidecar. The base Tauri configuration deliberately
+omits the release-only sidecar so Rust checks remain hermetic.
 
 ## Troubleshooting
 
@@ -169,8 +199,28 @@ npm run build
 ls src-tauri/target/release/bundle/
 ```
 
-Code-signing is required for notarized macOS / signed Windows builds; secrets
-are configured at the org level (see `streamlinelabs/.github`).
+Releases are **fail-closed**: `scripts/check-release-signing.mjs` runs before
+anything is built and aborts the job when a required signing variable is
+missing, so installers can never be published silently unsigned.
+
+| Platform | Required variables (repository/organization secrets) |
+|----------|------------------------------------------------------|
+| macOS | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` |
+| Windows | `WINDOWS_CERTIFICATE`, `WINDOWS_CERTIFICATE_PASSWORD`, `WINDOWS_CERTIFICATE_THUMBPRINT` |
+| Linux | none — Tauri does not code-sign Linux bundles |
+
+Unsigned artifacts are only produced by a manual `workflow_dispatch` run with
+`allow_unsigned = true`. That path uses the separate, manually gated
+`unsigned-dev` environment, never creates a GitHub Release, and uploads its
+output as `UNSIGNED-dev-<target>` workflow artifacts for local testing only.
+Manual runs also record the `streamline_ref` (tag or branch; default `main`)
+used to build the bundled core sidecar. Tag releases ignore that input and
+require the identically named core tag.
+Verify the preflight locally with:
+
+```bash
+node scripts/check-release-signing.mjs --platform darwin   # fails when unset
+```
 
 ## Roadmap
 
@@ -202,4 +252,3 @@ Desktop-specific notes:
 
 **Beta.** Suitable for local development and demos; not recommended as a
 production cluster manager. Breaking changes possible until 1.0.
-

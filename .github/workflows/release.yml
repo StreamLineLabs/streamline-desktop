@@ -3,12 +3,46 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      allow_unsigned:
+        description: 'Build UNSIGNED development artifacts (never published as a release)'
+        type: boolean
+        default: false
+      streamline_ref:
+        description: 'streamlinelabs/streamline tag or branch to bundle in this development build'
+        type: string
+        default: 'main'
 
 permissions:
   contents: write
 
 jobs:
+  verify-release-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Verify all desktop version authorities
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
+        run: |
+          node scripts/check-release-version.mjs \
+            --tag "${RELEASE_TAG}" \
+            --github-output "${GITHUB_OUTPUT}"
+
   release:
+    needs: verify-release-version
     strategy:
       fail-fast: false
       matrix:
@@ -23,6 +57,15 @@ jobs:
             target: x86_64-pc-windows-msvc
 
     runs-on: ${{ matrix.os }}
+    # Unsigned development builds are manually gated through a separate
+    # environment; tag pushes always require the production signing variables.
+    environment: ${{ (github.event_name == 'workflow_dispatch' && inputs.allow_unsigned) && 'unsigned-dev' || 'release' }}
+    env:
+      # A GitHub Release (and its tag) is only ever created by a pushed tag.
+      # Manual workflow_dispatch runs — signed or unsigned — build the same
+      # bundles but publish nothing, so they can never create a branch-named tag.
+      PUBLISH_RELEASE: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+      ALLOW_UNSIGNED_BUILD: ${{ (github.event_name == 'workflow_dispatch' && inputs.allow_unsigned) && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -39,11 +82,42 @@ jobs:
           node-version: 20
           cache: npm
 
+      # Fail closed before anything is built: a release must never be published
+      # silently unsigned. Only presence is checked, values are never printed.
+      - name: Release signing preflight
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        run: node scripts/check-release-signing.mjs
+
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      # Import the code-signing certificate so the Tauri bundler can sign with
+      # the configured thumbprint (documented Tauri Windows signing flow).
+      - name: Import Windows code-signing certificate
+        if: runner.os == 'Windows' && env.ALLOW_UNSIGNED_BUILD != 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP 'code-signing.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password | Out-Null
+          Remove-Item $pfxPath -Force
 
       - name: Install frontend dependencies
         run: npm ci
@@ -51,13 +125,90 @@ jobs:
       - name: Build frontend
         run: npx vite build
 
-      - name: Build and release Tauri app
+      - name: Build matching Streamline server
+        shell: bash
+        env:
+          # Tag releases always bundle the identically named core tag. Manual
+          # builds use an explicit, recorded input instead of silently
+          # substituting main for whichever desktop ref was selected.
+          STREAMLINE_REF: ${{ github.ref_type == 'tag' && github.ref_name || inputs.streamline_ref }}
+        run: |
+          set -euo pipefail
+          test -n "$STREAMLINE_REF" || {
+            echo "::error::streamline_ref must name the core revision to bundle."
+            exit 1
+          }
+          git clone --branch "$STREAMLINE_REF" --depth 1 \
+            https://github.com/streamlinelabs/streamline.git streamline-core
+          STREAMLINE_CORE_DIR=streamline-core TARGET="${{ matrix.target }}" \
+            node scripts/build-sidecar.mjs
+
+      # macOS signing/notarization is driven by the APPLE_* environment
+      # variables read by tauri-action; Windows signing needs the certificate
+      # thumbprint merged into the bundler configuration.
+      - name: Resolve bundler arguments
+        id: bundler
+        shell: bash
+        env:
+          WINDOWS_CERTIFICATE_THUMBPRINT: ${{ secrets.WINDOWS_CERTIFICATE_THUMBPRINT }}
+        run: |
+          args="--target ${{ matrix.target }} --config src-tauri/tauri.release.conf.json"
+          if [ "$RUNNER_OS" = "Windows" ] && [ "$ALLOW_UNSIGNED_BUILD" != "true" ]; then
+            args="$args --config {\"bundle\":{\"windows\":{\"certificateThumbprint\":\"$WINDOWS_CERTIFICATE_THUMBPRINT\",\"digestAlgorithm\":\"sha256\",\"timestampUrl\":\"http://timestamp.digicert.com\"}}}"
+          fi
+          echo "args=$args" >> "$GITHUB_OUTPUT"
+
+          if [ "$ALLOW_UNSIGNED_BUILD" = "true" ]; then
+            label="UNSIGNED-dev"
+          else
+            label="signed-dev"
+          fi
+          echo "artifact_name=$label-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+
+      # Only a pushed tag publishes. `tagName` is deliberately confined to this
+      # step so a manual run can never create a release or a branch-named tag.
+      - name: Build and publish tagged release
+        if: env.PUBLISH_RELEASE == 'true'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Streamline Desktop ${{ github.ref_name }}'
           releaseBody: 'See the [changelog](https://github.com/streamlinelabs/streamline-desktop/blob/main/CHANGELOG.md) for details.'
           releaseDraft: true
-          prerelease: false
+          prerelease: ${{ needs.verify-release-version.outputs.prerelease == 'true' }}
+          args: ${{ steps.bundler.outputs.args }}
+
+      # Manual runs build the same bundles without `tagName` and without a
+      # GITHUB_TOKEN, so tauri-action has neither the instruction nor the
+      # credentials to create a release or tag.
+      - name: Build development artifacts (never published)
+        if: env.PUBLISH_RELEASE != 'true'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          args: ${{ steps.bundler.outputs.args }}
+
+      # Development bundles are only ever workflow artifacts, labelled so a
+      # signed dev build is never mistaken for a release and an unsigned one is
+      # unmistakable.
+      - name: Upload development artifacts
+        if: env.PUBLISH_RELEASE != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.bundler.outputs.artifact_name }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/
+          if-no-files-found: error

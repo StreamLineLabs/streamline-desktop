@@ -1,24 +1,27 @@
 {
   "name": "streamline-desktop",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Streamline Desktop - The Redis of Streaming on your desktop",
   "private": true,
   "scripts": {
     "dev": "tauri dev",
-    "build": "tauri build",
+    "build": "tauri build --config src-tauri/tauri.release.conf.json",
+    "build:sidecar": "node scripts/build-sidecar.mjs",
+    "build:web": "vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.0.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
-    "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/cli": "^2.0.0",
-    "@types/react": "^19.2.14",
-    "@types/react-dom": "^19.2.3",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
     "@vitejs/plugin-react": "^4.0.0",
     "@vitest/ui": "^2.0.0",
     "jsdom": "^24.0.0",

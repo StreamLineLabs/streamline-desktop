@@ -4,8 +4,10 @@ import type {
   Toast,
   ServerStatus,
   TopicInfo,
+  ConsumedMessage,
   ServerInfo,
   Settings,
+  ServerSettingsPayload,
   ConsumerGroupInfo,
   ConsumerGroupDetail,
   GroupMember,
@@ -52,24 +54,47 @@ describe("Desktop Types", () => {
     expect(topic.partitions).toBe(3);
   });
 
+  it("should define ConsumedMessage with its partition", () => {
+    const message: ConsumedMessage = {
+      key: "key",
+      value: "value",
+      partition: 2,
+      offset: 10,
+    };
+    expect(message.partition).toBe(2);
+  });
+
   it("should define ServerInfo interface correctly", () => {
     const info: ServerInfo = {
       version: "0.2.0",
-      uptime: 3600,
-      topics: 5,
-      messages: 1000,
+      uptime_secs: 3600,
+      kafka_port: 9092,
+      http_port: 9094,
     };
     expect(info.version).toBe("0.2.0");
   });
 
   it("should define Settings interface correctly", () => {
     const settings: Settings = {
+      host: "127.0.0.1",
       kafkaPort: 9092,
       httpPort: 9094,
       dataDir: "/tmp/streamline",
       logLevel: "info",
     };
     expect(settings.kafkaPort).toBe(9092);
+    expect(settings.host).toBe("127.0.0.1");
+  });
+
+  it("should define the persisted settings payload", () => {
+    const settings: ServerSettingsPayload = {
+      host: "127.0.0.1",
+      kafka_port: 9092,
+      http_port: 9094,
+      data_dir: "/tmp/streamline",
+      log_level: "info",
+    };
+    expect(settings.host).toBe("127.0.0.1");
   });
 
   it("should define ConsumerGroupInfo interface correctly", () => {
@@ -235,10 +260,26 @@ describe("Preview Mode Invoke Mock", () => {
 
   it("load_settings returns valid Settings", async () => {
     const result = (await invoke("load_settings")) as Record<string, unknown>;
+    expect(result.host).toBe("127.0.0.1");
     expect(result.kafka_port).toBe(9092);
     expect(result.http_port).toBe(9094);
     expect(result.data_dir).toBeTruthy();
     expect(result.log_level).toBeTruthy();
+  });
+
+  it("load_settings preview data satisfies the backend validation policy", async () => {
+    const result = (await invoke("load_settings")) as Record<string, unknown>;
+    expect(["127.0.0.1", "localhost", "::1"]).toContain(result.host);
+    expect(result.kafka_port).not.toBe(result.http_port);
+    expect(String(result.data_dir).startsWith("/")).toBe(true);
+  });
+
+  it("get_settings_warning returns null in preview mode", async () => {
+    expect(await invoke("get_settings_warning")).toBeNull();
+  });
+
+  it("take_startup_error returns null in preview mode", async () => {
+    expect(await invoke("take_startup_error")).toBeNull();
   });
 
   it("start_server returns null without error", async () => {
@@ -264,12 +305,13 @@ describe("Preview Mode Invoke Mock", () => {
     const result = (await invoke("consume_messages", {
       topic: "test",
       limit: 50,
-    })) as Array<{ key: string; value: string; offset: number }>;
+    })) as ConsumedMessage[];
     expect(Array.isArray(result)).toBe(true);
     expect(result.length).toBeGreaterThan(0);
     for (const msg of result) {
       expect(typeof msg.key).toBe("string");
       expect(typeof msg.value).toBe("string");
+      expect(typeof msg.partition).toBe("number");
       expect(typeof msg.offset).toBe("number");
     }
   });

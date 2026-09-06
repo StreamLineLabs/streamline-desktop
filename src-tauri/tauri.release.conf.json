@@ -1,0 +1,8 @@
+{
+  "build": {
+    "beforeBuildCommand": "node scripts/check-bundled-server.mjs && npx vite build"
+  },
+  "bundle": {
+    "externalBin": ["binaries/streamline"]
+  }
+}
